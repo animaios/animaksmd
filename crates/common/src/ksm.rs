@@ -177,13 +177,14 @@ impl KsmController {
         );
 
         // Restore advisor mode FIRST so we can write pages_to_scan (kernel rejects
-        // direct writes to pages_to_scan while a scan-time advisor is active).
-        if snapshot.config.run == 0 || snapshot.config.advisor_mode != "scan-time" {
+        // direct writes to pages_to_scan while a scan-time advisor is active —
+        // unconditionally, regardless of whether KSM is running).
+        if snapshot.config.advisor_mode != "scan-time" {
             // Safe to set advisor mode to the snapshot value before writing pages_to_scan
             let _ = self.set_advisor_mode(&snapshot.config.advisor_mode);
         } else {
-            // We were running with an advisor; disable it temporarily so we can restore
-            // pages_to_scan, then re-enable the advisor mode.
+            // Temporarily disable the advisor so we can write pages_to_scan.
+            // We'll re-enable it below after restoring all other parameters.
             let _ = self.set_advisor_mode("none");
         }
 
