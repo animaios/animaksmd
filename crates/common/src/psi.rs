@@ -1,0 +1,306 @@
+//! PSI (Pressure Stall Information) monitoring module.
+//!
+//! Supports both polling and event-driven (kernel trigger) modes
+//! for monitoring memory pressure via /proc/pressure/memory.
+
+use crate::error::{Result, ZramdedupError};
+use std::fs;
+use std::path::Path;
+
+const PSI_MEMORY_PATH: &str = "/proc/pressure/memory";
+
+/// Parsed PSI stats for a single resource.
+#[derive(Debug, Clone, Default)]
+pub struct PsiStats {
+    pub some: PsiLine,
+    pub full: PsiLine,
+}
+
+/// One line of PSI data (some or full).
+#[derive(Debug, Clone, Default)]
+pub struct PsiLine {
+    pub avg10: f32,
+    pub avg60: f32,
+    pub avg300: f32,
+    pub total: u64,
+}
+
+/// Classified pressure level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PressureLevel {
+    Idle = 0,
+    Low = 1,
+    Medium = 2,
+    High = 3,
+    Critical = 4,
+}
+
+impl std::fmt::Display for PressureLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => write!(f, "idle"),
+            Self::Low => write!(f, "low"),
+            Self::Medium => write!(f, "medium"),
+            Self::High => write!(f, "high"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl PsiStats {
+    /// Read and parse current memory PSI stats.
+    pub fn read_memory() -> Result<Self> {
+        Self::read_from(Path::new(PSI_MEMORY_PATH))
+    }
+
+    /// Read PSI stats from an arbitrary path (useful for cgroup PSI).
+    pub fn read_from(path: &Path) -> Result<Self> {
+        let content = fs::read_to_string(path).map_err(|e| ZramdedupError::Sysfs {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
+        Self::parse(&content)
+    }
+
+    /// Parse PSI file content.
+    ///
+    /// Format:
+    /// ```text
+    /// some avg10=0.48 avg60=0.75 avg300=0.63 total=352754638
+    /// full avg10=0.12 avg60=0.34 avg300=0.45 total=241562312
+    /// ```
+    pub fn parse(content: &str) -> Result<Self> {
+        let mut stats = PsiStats::default();
+
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let parsed = Self::parse_line(line)?;
+
+            if line.starts_with("some") {
+                stats.some = parsed;
+            } else if line.starts_with("full") {
+                stats.full = parsed;
+            }
+        }
+
+        Ok(stats)
+    }
+
+    fn parse_line(line: &str) -> Result<PsiLine> {
+        let mut psi_line = PsiLine::default();
+
+        // Skip the first word ("some" or "full")
+        for token in line.split_whitespace().skip(1) {
+            if let Some((key, value)) = token.split_once('=') {
+                match key {
+                    "avg10" => {
+                        psi_line.avg10 = value.parse().unwrap_or(0.0);
+                    }
+                    "avg60" => {
+                        psi_line.avg60 = value.parse().unwrap_or(0.0);
+                    }
+                    "avg300" => {
+                        psi_line.avg300 = value.parse().unwrap_or(0.0);
+                    }
+                    "total" => {
+                        psi_line.total = value.parse().unwrap_or(0);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(psi_line)
+    }
+
+    /// Classify pressure into a level using configurable thresholds.
+    pub fn classify(&self, some_threshold: f32, full_threshold: f32) -> PressureLevel {
+        let score = 0.7 * self.full.avg10 + 0.3 * self.some.avg10;
+
+        if score >= 20.0 {
+            PressureLevel::Critical
+        } else if score >= 10.0 || self.full.avg10 >= full_threshold * 2.0 {
+            PressureLevel::High
+        } else if score >= 5.0 || self.some.avg10 >= some_threshold {
+            PressureLevel::Medium
+        } else if score >= 0.5 {
+            PressureLevel::Low
+        } else {
+            PressureLevel::Idle
+        }
+    }
+}
+
+/// PSI trigger for event-driven monitoring.
+///
+/// Owns its own file descriptor to `/proc/pressure/memory` and manages
+/// the full lifecycle: open → register trigger → re-arm → close.
+///
+/// PSI triggers are **edge-triggered**: after each event fires, the
+/// trigger must be re-armed by re-writing the trigger string. The
+/// `rearm()` method handles this.
+pub struct PsiTrigger {
+    /// Owned file descriptor (closed on Drop).
+    fd: std::os::unix::io::RawFd,
+    pub kind: PsiTriggerKind,
+    pub threshold_us: u64,
+    pub window_us: u64,
+    /// The trigger string (cached for re-arm).
+    trigger_str: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PsiTriggerKind {
+    Some,
+    Full,
+}
+
+impl PsiTrigger {
+    /// Create a new PSI trigger: opens `/proc/pressure/memory`, writes the
+    /// trigger string, and returns a ready-to-epoll trigger.
+    ///
+    /// Window range: 500_000 to 10_000_000 (500ms to 10s).
+    pub fn new(
+        kind: PsiTriggerKind,
+        threshold_us: u64,
+        window_us: u64,
+    ) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Open our own fd to /proc/pressure/memory with O_RDWR
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_RDWR)
+            .open(PSI_MEMORY_PATH)
+            .map_err(|e| ZramdedupError::Sysfs {
+                path: Path::new(PSI_MEMORY_PATH).to_path_buf(),
+                source: e,
+            })?;
+
+        use std::os::unix::io::IntoRawFd;
+        let fd = file.into_raw_fd();
+
+        let kind_str = match kind {
+            PsiTriggerKind::Some => "some",
+            PsiTriggerKind::Full => "full",
+        };
+        let trigger_str = format!("{kind_str} {threshold_us} {window_us}");
+
+        // Write the trigger string to register with the kernel
+        Self::write_trigger(fd, &trigger_str)?;
+
+        Ok(Self {
+            fd,
+            kind,
+            threshold_us,
+            window_us,
+            trigger_str,
+        })
+    }
+
+    /// Re-arm the trigger after an edge event fires.
+    ///
+    /// PSI triggers are edge-triggered: after epoll returns POLLPRI,
+    /// the trigger must be re-written to fire again. This method
+    /// re-writes the cached trigger string.
+    pub fn rearm(&self) -> Result<()> {
+        Self::write_trigger(self.fd, &self.trigger_str)
+    }
+
+    /// Get the raw fd for use with epoll/tokio.
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.fd
+    }
+
+    /// Internal: write trigger string to fd.
+    fn write_trigger(fd: std::os::unix::io::RawFd, trigger_str: &str) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+
+        // Safety: we borrow the fd temporarily, the caller/PsiTrigger owns it.
+        let mut file = unsafe { fs::File::from_raw_fd(fd) };
+        let result = file
+            .write_all(trigger_str.as_bytes())
+            .map_err(|e| ZramdedupError::Sysfs {
+                path: Path::new(PSI_MEMORY_PATH).to_path_buf(),
+                source: e,
+            });
+        // Don't drop the file — we don't own the fd.
+        std::mem::forget(file);
+
+        result
+    }
+}
+
+impl Drop for PsiTrigger {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_psi_content() {
+        let content = "some avg10=1.07 avg60=0.46 avg300=0.49 total=351068534\n\
+                        full avg10=0.50 avg60=0.25 avg300=0.30 total=200000000\n";
+
+        let stats = PsiStats::parse(content).unwrap();
+        assert!((stats.some.avg10 - 1.07).abs() < 0.001);
+        assert!((stats.full.avg10 - 0.50).abs() < 0.001);
+        assert_eq!(stats.some.total, 351068534);
+        assert_eq!(stats.full.total, 200000000);
+    }
+
+    #[test]
+    fn test_classify_idle() {
+        let stats = PsiStats {
+            some: PsiLine {
+                avg10: 0.1,
+                avg60: 0.05,
+                ..Default::default()
+            },
+            full: PsiLine {
+                avg10: 0.0,
+                avg60: 0.0,
+                ..Default::default()
+            },
+        };
+        assert_eq!(stats.classify(5.0, 2.0), PressureLevel::Idle);
+    }
+
+    #[test]
+    fn test_classify_high() {
+        let stats = PsiStats {
+            some: PsiLine {
+                avg10: 12.0,
+                avg60: 8.0,
+                ..Default::default()
+            },
+            full: PsiLine {
+                avg10: 8.0,
+                avg60: 5.0,
+                ..Default::default()
+            },
+        };
+        let level = stats.classify(5.0, 2.0);
+        assert!(level >= PressureLevel::High);
+    }
+
+    #[test]
+    fn test_pressure_level_ordering() {
+        assert!(PressureLevel::Idle < PressureLevel::Low);
+        assert!(PressureLevel::Low < PressureLevel::Medium);
+        assert!(PressureLevel::Medium < PressureLevel::High);
+        assert!(PressureLevel::High < PressureLevel::Critical);
+    }
+}

@@ -1,0 +1,25 @@
+[package]
+name = "zramdedup-swap-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zramdedup-swap-proxy"
+path = "src/main.rs"
+
+[dependencies]
+zramdedup-common = { path = "../common" }
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-journald.workspace = true
+tokio.workspace = true
+clap.workspace = true
+nix.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xxhash-rust.workspace = true
+dashmap = "6"
+crossbeam = "0.8"
+parking_lot = "0.12"

@@ -1,0 +1,39 @@
+# zramdedup configuration
+# Trades CPU cycles for effective RAM by dynamically tuning KSM and memory scanning.
+
+[general]
+log_level = "info"
+poll_interval_ms = 2000
+state_dir = "/var/lib/zramdedup"
+
+[governor]
+enabled = true
+use_advisor = true              # Kernel advisor = primary; governor biases bounds only
+psi_some_threshold = 5.0        # avg10 % for ramp-up
+psi_full_threshold = 2.0        # avg10 % for critical
+advisor_scan_time_range = [30, 600]  # seconds [aggressive, relaxed]
+max_page_sharing_range = [256, 1024]
+hysteresis_readings = 3         # consecutive low readings before stepping down
+min_level_duration_secs = 10    # cooldown before stepping down
+stabilization_secs = 30         # global damping: min seconds between ANY tier actions
+ksm_path = "/sys/kernel/mm/ksm"
+
+[scanner]
+enabled = true
+interval_secs = 30              # how often to scan processes
+min_anon_rss_mb = 100           # only consider processes with >100MB anonymous RSS
+duplicate_ratio_threshold = 0.15
+max_mergeable_per_process_mb = 512  # cap per-process to avoid over-marking
+max_candidates_per_cycle = 5    # top K by RSS only (avoid O(n*m) cost)
+blocklist = ["zramdedup", "ksmd", "systemd", "sshd", "journald", "udevd"]
+target_cgroups = []             # empty = scan all user processes
+
+[swap_proxy]
+enabled = false                 # EXPERIMENTAL - set to true to enable
+device_size_gb = 8
+fingerprint = "xxh3-128"
+dedup_table_max_entries = 1000000
+zram_backend = "/dev/zram0"
+bloom_capacity = 1000000
+bloom_false_positive_rate = 0.01
+page_store_path = "/var/lib/zramdedup/pagestore.dat"

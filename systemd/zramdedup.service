@@ -1,0 +1,30 @@
+[Unit]
+Description=Zramdedup KSM Governor and Memory Scanner
+Documentation=https://github.com/yourusername/zramdedup
+After=local-fs.target
+ConditionPathExists=/sys/kernel/mm/ksm
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/zramdedup run --config /etc/zramdedup.toml
+ExecStopPost=-/usr/local/bin/zramdedup restore-ksm --config /etc/zramdedup.toml
+Restart=on-failure
+RestartSec=5
+WatchdogSec=30
+
+# Security hardening
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/zramdedup
+ReadOnlyPaths=/proc/pressure /sys/kernel/mm/ksm
+
+# Resource limits
+MemoryMax=32M
+Nice=19
+
+[Install]
+WantedBy=multi-user.target

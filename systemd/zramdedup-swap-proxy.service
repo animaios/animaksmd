@@ -1,0 +1,22 @@
+[Unit]
+Description=Zramdedup Deduplicating Swap Proxy (experimental)
+Documentation=https://github.com/yourusername/zramdedup
+BindsTo=zramdedup.service
+After=zramdedup.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/zramdedup-swap-proxy run --store-path /var/lib/zramdedup/pagestore.dat
+ExecStopPost=-/usr/local/bin/zramdedup-swap-proxy cleanup
+Restart=no
+
+# Security hardening
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_RAWIO
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_RAWIO
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/zramdedup
+
+[Install]
+WantedBy=multi-user.target
