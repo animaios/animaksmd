@@ -22,10 +22,14 @@ pub struct GovernorState {
     pub pages_sharing: u64,
     pub general_profit: i64,
     pub last_adjustment: Instant,
-    /// Timestamp of the last global actuation change (KSM param write,
-    /// madvise burst, or dedup table expansion). Used to enforce the
-    /// stabilization window and prevent coupled feedback oscillation.
+    /// Timestamp of the last actuation by any tier. Kept for observability;
+    /// stabilization gates use the per-tier timestamps below so one loop
+    /// cannot starve another.
     pub last_global_action: Instant,
+    /// Timestamp of the last governor KSM profile write.
+    pub last_governor_action: Instant,
+    /// Timestamp of the last scanner madvise burst.
+    pub last_scanner_action: Instant,
     pub scanner_enabled: bool,
 }
 
@@ -39,6 +43,8 @@ impl Default for GovernorState {
             general_profit: 0,
             last_adjustment: now,
             last_global_action: now,
+            last_governor_action: now,
+            last_scanner_action: now,
             scanner_enabled: false,
         }
     }

@@ -103,9 +103,9 @@ pub struct GovernorConfig {
     pub max_page_sharing_range: (u32, u32),
     pub hysteresis_readings: u32,
     pub min_level_duration_secs: u64,
-    /// Global stabilization window (seconds): minimum time between ANY
-    /// system-wide actuation changes (KSM params, madvise bursts, dedup
-    /// expansion). Prevents coupled feedback loop oscillation.
+    /// Stabilization window (seconds): minimum time between repeated actions
+    /// within the same tier. Governor and scanner keep separate timestamps so
+    /// one tier cannot starve another.
     pub stabilization_secs: u64,
     /// Path to KSM sysfs directory.
     pub ksm_path: String,

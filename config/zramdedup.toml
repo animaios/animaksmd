@@ -15,7 +15,7 @@ advisor_scan_time_range = [30, 600]  # seconds [aggressive, relaxed]
 max_page_sharing_range = [256, 1024]
 hysteresis_readings = 3         # consecutive low readings before stepping down
 min_level_duration_secs = 10    # cooldown before stepping down
-stabilization_secs = 30         # global damping: min seconds between ANY tier actions
+stabilization_secs = 30         # per-tier damping: min seconds between repeated actions
 ksm_path = "/sys/kernel/mm/ksm"
 
 [scanner]

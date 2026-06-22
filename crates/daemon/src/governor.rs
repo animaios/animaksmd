@@ -12,11 +12,11 @@
 //!
 //! This avoids two controllers fighting the same parameters.
 //!
-//! ## Global Damping
+//! ## Stabilization
 //!
-//! A stabilization window prevents coupled feedback oscillation between
-//! the governor, scanner, and swap proxy tiers. No system-wide actuation
-//! changes are made within this window.
+//! A stabilization window damps repeated governor profile changes. Other
+//! tiers maintain their own stabilization timestamps so a KSM profile write
+//! cannot starve the process scanner.
 
 use std::time::{Duration, Instant};
 
@@ -194,8 +194,10 @@ impl Governor {
         };
 
         // Classify pressure
-        let pressure =
-            psi.classify(self.config.psi_some_threshold, self.config.psi_full_threshold);
+        let pressure = psi.classify(
+            self.config.psi_some_threshold,
+            self.config.psi_full_threshold,
+        );
 
         // Determine target level
         let target_level = self.pressure_to_level(pressure);
@@ -203,13 +205,13 @@ impl Governor {
         // Apply transition logic with hysteresis
         let new_level = self.compute_transition(target_level);
 
-        // Apply profile if level changed (with global damping check)
+        // Apply profile if level changed (with per-governor damping check)
         if new_level != self.current_level {
-            // Check global stabilization window
+            // Check governor stabilization window
             let stabilization = Duration::from_secs(self.config.stabilization_secs);
             let time_since_action = {
                 let s = state.read().await;
-                s.last_global_action.elapsed()
+                s.last_governor_action.elapsed()
             };
 
             if time_since_action >= stabilization {
@@ -217,7 +219,7 @@ impl Governor {
             } else {
                 debug!(
                     remaining_secs = (stabilization - time_since_action).as_secs(),
-                    "Level change deferred (stabilization window)"
+                    "Level change deferred (governor stabilization window)"
                 );
             }
         }
@@ -328,7 +330,9 @@ impl Governor {
 
         // Always write these — they are the governor's "bias knobs"
         let _ = self.ksm.set_sleep_millisecs(profile.sleep_millisecs);
-        let _ = self.ksm.set_max_page_sharing(profile.max_page_sharing as u64);
+        let _ = self
+            .ksm
+            .set_max_page_sharing(profile.max_page_sharing as u64);
 
         if self.config.use_advisor {
             // Option B: DON'T write pages_to_scan or advisor_target_scan_time.
@@ -345,10 +349,318 @@ impl Governor {
 
         self.current_level = level;
 
-        // Update global action timestamp for stabilization damping
+        // Update governor stabilization timestamp. Keep the global timestamp
+        // as observability for "anything acted" without using it as a gate.
         {
             let mut s = state.write().await;
+            s.last_governor_action = Instant::now();
             s.last_global_action = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zramdedup_common::new_shared_state;
+
+    /// Create a Governor with default config and a dry-run KSM controller.
+    fn make_gov() -> Governor {
+        let mut ksm = KsmController::new("/sys/kernel/mm/ksm").unwrap();
+        ksm.set_dry_run(true);
+        Governor::new(GovernorConfig::default(), ksm)
+    }
+
+    /// Create a Governor with a modified config.
+    fn make_gov_with(f: impl FnOnce(&mut GovernorConfig)) -> Governor {
+        let mut config = GovernorConfig::default();
+        f(&mut config);
+        let mut ksm = KsmController::new("/sys/kernel/mm/ksm").unwrap();
+        ksm.set_dry_run(true);
+        Governor::new(config, ksm)
+    }
+
+    // ── Initial state ────────────────────────────────────────────────
+
+    #[test]
+    fn test_new_initial_state() {
+        let gov = make_gov();
+        assert_eq!(gov.current_level, 0, "should start at Idle level");
+        assert_eq!(gov.hysteresis_count, 0);
+        assert_eq!(gov.stable_psi_ticks, 0);
+        assert!(gov.last_psi.is_none());
+    }
+
+    // ── PROFILES table integrity ─────────────────────────────────────
+
+    #[test]
+    fn test_profiles_len() {
+        assert_eq!(PROFILES.len(), 6, "must have exactly 6 profiles (0..=5)");
+    }
+
+    #[test]
+    fn test_profiles_sequential() {
+        for (i, p) in PROFILES.iter().enumerate() {
+            assert_eq!(p.level as usize, i, "PROFILES[{i}] has mismatched level");
+        }
+    }
+
+    #[test]
+    fn test_profiles_idle_stops_ksm() {
+        assert_eq!(PROFILES[0].run, 0, "Idle profile must set run=0");
+        for i in 1..=5 {
+            assert!(PROFILES[i].run > 0, "Profile {i} should have run>0");
+        }
+    }
+
+    #[test]
+    fn test_profiles_monotonic() {
+        // Higher levels = strictly more aggressive or equal
+        for i in 1..=5 {
+            let prev = &PROFILES[i - 1];
+            let cur = &PROFILES[i];
+            assert!(
+                cur.max_page_sharing >= prev.max_page_sharing,
+                "max_page_sharing regressed at level {i}: {} < {}",
+                cur.max_page_sharing,
+                prev.max_page_sharing
+            );
+            assert!(
+                cur.sleep_millisecs <= prev.sleep_millisecs,
+                "sleep_millisecs increased at level {i}: {} > {}",
+                cur.sleep_millisecs,
+                prev.sleep_millisecs
+            );
+            assert!(
+                cur.pages_to_scan >= prev.pages_to_scan,
+                "pages_to_scan regressed at level {i}: {} < {}",
+                cur.pages_to_scan,
+                prev.pages_to_scan
+            );
+        }
+    }
+
+    // ── pressure_to_level ────────────────────────────────────────────
+
+    #[test]
+    fn test_pressure_to_level_idle() {
+        let gov = make_gov();
+        assert_eq!(gov.pressure_to_level(PressureLevel::Idle), 0);
+    }
+
+    #[test]
+    fn test_pressure_to_level_low() {
+        let gov = make_gov();
+        assert_eq!(gov.pressure_to_level(PressureLevel::Low), 1);
+    }
+
+    #[test]
+    fn test_pressure_to_level_medium_skips_2() {
+        let gov = make_gov();
+        // Medium maps to 3 (jumps over profile level 2, which is only
+        // reached during ramp-down from Active/Higher)
+        assert_eq!(gov.pressure_to_level(PressureLevel::Medium), 3);
+    }
+
+    #[test]
+    fn test_pressure_to_level_high() {
+        let gov = make_gov();
+        assert_eq!(gov.pressure_to_level(PressureLevel::High), 4);
+    }
+
+    #[test]
+    fn test_pressure_to_level_critical() {
+        let gov = make_gov();
+        assert_eq!(gov.pressure_to_level(PressureLevel::Critical), 5);
+    }
+
+    // ── compute_transition (ramp-up) ─────────────────────────────────
+
+    #[test]
+    fn test_ramp_up_immediate() {
+        let mut gov = make_gov();
+        gov.current_level = 0;
+        let result = gov.compute_transition(3);
+        assert_eq!(result, 3, "ramp-up must be immediate");
+        assert_eq!(gov.hysteresis_count, 0, "hysteresis reset on ramp-up");
+    }
+
+    #[test]
+    fn test_ramp_up_from_any_level() {
+        let mut gov = make_gov();
+        for start in 0..=4u8 {
+            gov.current_level = start;
+            let target = start + 1;
+            let result = gov.compute_transition(target);
+            assert_eq!(
+                result, target,
+                "ramp-up from {start} to {target} should be immediate"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ramp_up_resets_full_scans_tracking() {
+        let mut gov = make_gov();
+        gov.current_level = 0;
+        gov.full_scans_at_level = 999;
+        let _ = gov.compute_transition(4);
+        assert_eq!(
+            gov.full_scans_at_level, 0,
+            "full_scans_at_level reset on ramp-up"
+        );
+    }
+
+    // ── compute_transition (same level) ──────────────────────────────
+
+    #[test]
+    fn test_same_level_resets_hysteresis() {
+        let mut gov = make_gov();
+        gov.current_level = 3;
+        gov.hysteresis_count = 42; // some pending count
+        let result = gov.compute_transition(3);
+        assert_eq!(result, 3);
+        assert_eq!(
+            gov.hysteresis_count, 0,
+            "hysteresis reset on same-level tick"
+        );
+    }
+
+    // ── compute_transition (ramp-down with cooldown) ─────────────────
+
+    #[test]
+    fn test_ramp_down_cooldown_blocks() {
+        // min_level_duration_secs=10, and level_entered_at was just set
+        // (the Governor was constructed moments ago). Elapsed < 10s → blocked.
+        let mut gov = make_gov_with(|c| c.min_level_duration_secs = 10);
+        gov.current_level = 4;
+
+        let result = gov.compute_transition(1);
+        assert_eq!(result, 4, "cooldown should block ramp-down");
+        assert_eq!(gov.hysteresis_count, 0, "cooldown: no hysteresis increment");
+    }
+
+    #[test]
+    fn test_ramp_down_cooldown_bypassed_after_duration() {
+        // min_level_duration_secs=0 → cooldown never blocks
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 1;
+        });
+        gov.current_level = 3;
+
+        let result = gov.compute_transition(1);
+        // hysteresis_readings=1, so immediately steps down
+        assert_eq!(result, 2, "should step down by 1");
+    }
+
+    // ── compute_transition (ramp-down with hysteresis) ───────────────
+
+    #[test]
+    fn test_ramp_down_hysteresis_counting() {
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 3;
+        });
+        gov.current_level = 4;
+
+        // Call 1: starts counting
+        assert_eq!(gov.compute_transition(1), 4);
+        assert_eq!(gov.hysteresis_count, 1);
+
+        // Call 2: counting
+        assert_eq!(gov.compute_transition(1), 4);
+        assert_eq!(gov.hysteresis_count, 2);
+
+        // Call 3: threshold reached → step down
+        assert_eq!(gov.compute_transition(1), 3);
+        assert_eq!(gov.hysteresis_count, 0);
+    }
+
+    #[test]
+    fn test_ramp_down_steps_one_at_a_time() {
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 1;
+        });
+        gov.current_level = 5;
+
+        // Each call steps down by exactly 1, regardless of how far the
+        // target is.
+        let r1 = gov.compute_transition(0);
+        assert_eq!(r1, 4);
+        gov.current_level = r1;
+
+        let r2 = gov.compute_transition(0);
+        assert_eq!(r2, 3);
+        gov.current_level = r2;
+
+        let r3 = gov.compute_transition(0);
+        assert_eq!(r3, 2);
+    }
+
+    #[test]
+    fn test_ramp_down_resets_on_ramp_up_midway() {
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 5; // lots of readings needed
+        });
+        gov.current_level = 4;
+
+        // Start ramping down (2 hysteresis ticks)
+        let _ = gov.compute_transition(1);
+        let _ = gov.compute_transition(1);
+        assert_eq!(gov.hysteresis_count, 2);
+
+        // PSI spikes back up before we finished stepping down
+        let r = gov.compute_transition(5); // target > current → ramp-up
+        assert_eq!(r, 5, "ramp-up must override pending ramp-down");
+        assert_eq!(gov.hysteresis_count, 0, "hysteresis reset by ramp-up");
+    }
+
+    // ── apply_profile (dry-run) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_apply_profile_dry_run_changes_level() {
+        let mut ksm = KsmController::new("/sys/kernel/mm/ksm").unwrap();
+        ksm.set_dry_run(true);
+        let mut gov = Governor::new(GovernorConfig::default(), ksm);
+        let state = new_shared_state();
+
+        assert_eq!(gov.current_level, 0);
+        gov.apply_profile(3, &state).await;
+        assert_eq!(gov.current_level, 3);
+    }
+
+    #[tokio::test]
+    async fn test_apply_profile_updates_governor_action() {
+        let mut ksm = KsmController::new("/sys/kernel/mm/ksm").unwrap();
+        ksm.set_dry_run(true);
+        let mut gov = Governor::new(GovernorConfig::default(), ksm);
+        let state = new_shared_state();
+
+        gov.apply_profile(2, &state).await;
+
+        let s = state.read().await;
+        assert!(
+            s.last_governor_action.elapsed().as_secs() < 5,
+            "last_governor_action should have been updated very recently"
+        );
+        assert!(
+            s.last_global_action.elapsed().as_secs() < 5,
+            "last_global_action telemetry should have been updated very recently"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_profile_idle_stops_ksm() {
+        let mut ksm = KsmController::new("/sys/kernel/mm/ksm").unwrap();
+        ksm.set_dry_run(true);
+        let mut gov = Governor::new(GovernorConfig::default(), ksm);
+        let state = new_shared_state();
+
+        // Going to level 0 (Idle) should be fine
+        gov.apply_profile(0, &state).await;
+        assert_eq!(gov.current_level, 0);
     }
 }

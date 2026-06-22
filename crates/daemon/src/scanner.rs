@@ -15,8 +15,8 @@
 //!
 //! ## Stabilization
 //!
-//! Respects the global stabilization window to prevent feedback oscillation
-//! with the governor tier.
+//! Respects its own stabilization window for madvise bursts. Governor profile
+//! changes use a separate timestamp and do not block scanner cycles.
 
 use std::time::{Duration, Instant};
 
@@ -105,16 +105,20 @@ impl Scanner {
 
     /// Execute one scan cycle with multi-level filtering.
     async fn scan_cycle(&mut self, state: &SharedGovernorState) {
-        // Check global stabilization window
+        // Check scanner stabilization window. This intentionally does not use
+        // the governor timestamp; a recent KSM profile write must not starve
+        // process discovery/madvise.
         let stabilization = Duration::from_secs(self.stabilization_secs);
         {
             let s = state.read().await;
-            if s.last_global_action.elapsed() < stabilization {
-                debug!("Scanner deferred (stabilization window active)");
+            if s.last_scanner_action.elapsed() < stabilization {
+                debug!("Scanner deferred (scanner stabilization window active)");
                 self.stats.skipped_stabilization += 1;
                 return;
             }
         }
+
+        let madvise_calls_before = self.stats.madvise_calls;
 
         // === Level 1: Cheap /proc/PID/status filter ===
         // Only read VmAnon — no maps parsing, no pagemap.
@@ -277,9 +281,7 @@ impl Scanner {
         // Opportunistic MADV_COLLAPSE: if KSM has been unmerging pages
         // (high pages_volatile), try to re-promote large regions to THPs
         // for TLB efficiency. Only on processes we already touched.
-        if let Ok(ksm_stats) = zramdedup_common::ksm::KsmController::new(
-            "/sys/kernel/mm/ksm",
-        ) {
+        if let Ok(ksm_stats) = zramdedup_common::ksm::KsmController::new("/sys/kernel/mm/ksm") {
             if let Ok(stats) = ksm_stats.read_stats() {
                 if stats.pages_volatile > 1000 {
                     for (pid, maps) in &targets {
@@ -292,9 +294,12 @@ impl Scanner {
             }
         }
 
-        // Update global action timestamp if we actually did something
-        if self.stats.madvise_calls > 0 {
+        // Update scanner stabilization timestamp if this cycle actually did
+        // something. `madvise_calls` is cumulative, so compare against the
+        // start-of-cycle value instead of checking it for nonzero.
+        if self.stats.madvise_calls > madvise_calls_before {
             let mut s = state.write().await;
+            s.last_scanner_action = Instant::now();
             s.last_global_action = Instant::now();
         }
 
@@ -316,5 +321,96 @@ impl Scanner {
     #[allow(dead_code)]
     pub fn stats(&self) -> &ScannerStats {
         &self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use zramdedup_common::config::ScannerConfig;
+    use zramdedup_common::GovernorState;
+
+    // ── Integration: scanner not blocked by governor actions ──────────
+
+    #[tokio::test]
+    async fn scanner_stabilization_is_not_blocked_by_governor_action() {
+        let mut scanner = Scanner::new(
+            ScannerConfig {
+                min_anon_rss_mb: u64::MAX,
+                ..ScannerConfig::default()
+            },
+            true,
+            30,
+        );
+        let state = Arc::new(RwLock::new(GovernorState::default()));
+
+        {
+            let mut s = state.write().await;
+            s.last_governor_action = Instant::now();
+            s.last_global_action = Instant::now();
+            s.last_scanner_action = Instant::now() - Duration::from_secs(31);
+        }
+
+        scanner.scan_cycle(&state).await;
+
+        assert_eq!(
+            scanner.stats.skipped_stabilization, 0,
+            "a fresh governor action must not defer the scanner"
+        );
+    }
+
+    // ── Unit tests: constructor and defaults ──────────────────────────
+
+    #[test]
+    fn test_scanner_new_initial_state() {
+        let scanner = Scanner::new(ScannerConfig::default(), false, 30);
+        assert_eq!(scanner.config.interval_secs, 30);
+        assert_eq!(scanner.dry_run, false);
+        assert_eq!(scanner.stabilization_secs, 30);
+        assert_eq!(scanner.stats.scan_cycles, 0);
+        assert_eq!(scanner.stats.skipped_stabilization, 0);
+    }
+
+    #[test]
+    fn test_scanner_stats_default() {
+        let stats = ScannerStats::default();
+        assert_eq!(stats.scan_cycles, 0);
+        assert_eq!(stats.processes_filtered_l1, 0);
+        assert_eq!(stats.processes_filtered_l2, 0);
+        assert_eq!(stats.processes_filtered_l25_profit, 0);
+        assert_eq!(stats.processes_targeted, 0);
+        assert_eq!(stats.madvise_calls, 0);
+        assert_eq!(stats.total_bytes_marked, 0);
+        assert_eq!(stats.skipped_stabilization, 0);
+        assert_eq!(stats.thp_collapsed, 0);
+    }
+
+    #[test]
+    fn test_scanner_new_respects_dry_run() {
+        let scanner = Scanner::new(ScannerConfig::default(), true, 60);
+        assert!(scanner.dry_run);
+        assert_eq!(scanner.stabilization_secs, 60);
+    }
+
+    #[test]
+    fn test_scanner_stats_getter() {
+        let scanner = Scanner::new(ScannerConfig::default(), false, 30);
+        let stats = scanner.stats();
+        assert_eq!(stats.scan_cycles, 0);
+    }
+
+    #[test]
+    fn test_scanner_new_with_nondefault_config() {
+        let mut config = ScannerConfig::default();
+        config.interval_secs = 120;
+        config.min_anon_rss_mb = 200;
+        config.max_candidates_per_cycle = 10;
+
+        let scanner = Scanner::new(config, false, 30);
+        assert_eq!(scanner.config.interval_secs, 120);
+        assert_eq!(scanner.config.min_anon_rss_mb, 200);
+        assert_eq!(scanner.config.max_candidates_per_cycle, 10);
     }
 }
