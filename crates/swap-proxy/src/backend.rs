@@ -37,10 +37,7 @@ pub struct PageStore {
 impl PageStore {
     /// Open a block device or file as a page store.
     pub fn open(path: &Path, total_slots: u64) -> anyhow::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         Ok(Self {
             file,
@@ -153,11 +150,19 @@ impl TranslationTable {
     }
 
     /// Record that a virtual offset maps to a given fingerprint and backend slot.
-    pub fn insert(&mut self, virtual_offset: u64, fingerprint: crate::fingerprint::Fingerprint, backend_slot: u64) {
-        self.entries.insert(virtual_offset, TranslationEntry {
-            fingerprint,
-            backend_slot,
-        });
+    pub fn insert(
+        &mut self,
+        virtual_offset: u64,
+        fingerprint: crate::fingerprint::Fingerprint,
+        backend_slot: u64,
+    ) {
+        self.entries.insert(
+            virtual_offset,
+            TranslationEntry {
+                fingerprint,
+                backend_slot,
+            },
+        );
     }
 
     /// Look up the translation for a virtual offset.
@@ -174,5 +179,129 @@ impl TranslationTable {
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fingerprint::{fingerprint_page, PAGE_SIZE};
+
+    #[test]
+    fn test_page_store_create_file_preallocates_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.dat");
+
+        let store = PageStore::create_file(&path, 3).unwrap();
+
+        assert_eq!(store.total_slots(), 3);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            3 * PAGE_SIZE as u64
+        );
+    }
+
+    #[test]
+    fn test_page_store_open_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.dat");
+        std::fs::write(&path, vec![0u8; 2 * PAGE_SIZE]).unwrap();
+
+        let store = PageStore::open(&path, 2).unwrap();
+
+        assert_eq!(store.total_slots(), 2);
+    }
+
+    #[test]
+    fn test_page_store_write_and_read_full_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.dat");
+        let mut store = PageStore::create_file(&path, 2).unwrap();
+        let data = vec![0xAB; PAGE_SIZE];
+
+        store.write_page(1, &data).unwrap();
+        let read = store.read_page(1).unwrap();
+
+        assert_eq!(read, data);
+        let stats = store.stats();
+        assert_eq!(stats.pages_written, 1);
+        assert_eq!(stats.pages_read, 1);
+        assert_eq!(stats.slots_allocated, 2);
+    }
+
+    #[test]
+    fn test_page_store_short_write_is_zero_padded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.dat");
+        let mut store = PageStore::create_file(&path, 1).unwrap();
+
+        store.write_page(0, &[1, 2, 3]).unwrap();
+        let read = store.read_page(0).unwrap();
+
+        assert_eq!(&read[..3], &[1, 2, 3]);
+        assert!(read[3..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn test_page_store_long_write_is_truncated_to_page_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.dat");
+        let mut store = PageStore::create_file(&path, 1).unwrap();
+        let mut data = vec![0xAA; PAGE_SIZE + 16];
+        data[PAGE_SIZE - 1] = 0xBB;
+        data[PAGE_SIZE] = 0xCC;
+
+        store.write_page(0, &data).unwrap();
+        let read = store.read_page(0).unwrap();
+
+        assert_eq!(read.len(), PAGE_SIZE);
+        assert_eq!(read[PAGE_SIZE - 1], 0xBB);
+        assert!(!read.contains(&0xCC));
+    }
+
+    #[test]
+    fn test_page_store_rejects_out_of_range_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.dat");
+        let mut store = PageStore::create_file(&path, 1).unwrap();
+
+        assert!(store.write_page(1, &[0xAA]).is_err());
+        assert!(store.read_page(1).is_err());
+    }
+
+    #[test]
+    fn test_translation_table_insert_lookup_remove_len() {
+        let mut table = TranslationTable::new();
+        let page = vec![0x42; PAGE_SIZE];
+        let fp = fingerprint_page(&page);
+
+        assert_eq!(table.len(), 0);
+        assert!(table.lookup(0).is_none());
+
+        table.insert(0, fp, 7);
+        assert_eq!(table.len(), 1);
+        let entry = table.lookup(0).unwrap();
+        assert_eq!(entry.fingerprint, fp);
+        assert_eq!(entry.backend_slot, 7);
+
+        let removed = table.remove(0).unwrap();
+        assert_eq!(removed.backend_slot, 7);
+        assert_eq!(table.len(), 0);
+        assert!(table.remove(0).is_none());
+    }
+
+    #[test]
+    fn test_translation_table_insert_replaces_existing_entry() {
+        let mut table = TranslationTable::new();
+        let fp_a = fingerprint_page(&vec![0xAA; PAGE_SIZE]);
+        let fp_b = fingerprint_page(&vec![0xBB; PAGE_SIZE]);
+
+        table.insert(4096, fp_a, 1);
+        table.insert(4096, fp_b, 2);
+
+        assert_eq!(table.len(), 1);
+        let entry = table.lookup(4096).unwrap();
+        assert_eq!(entry.fingerprint, fp_b);
+        assert_eq!(entry.backend_slot, 2);
     }
 }

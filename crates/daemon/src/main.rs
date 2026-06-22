@@ -18,8 +18,9 @@ use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use zramdedup_common::config::ZramdedupConfig;
-use zramdedup_common::ksm::KsmController;
+use zramdedup_common::ksm::{KsmConfig, KsmController, KsmStats};
 use zramdedup_common::new_shared_state;
+use zramdedup_common::psi::PsiStats;
 
 #[derive(Parser)]
 #[command(name = "zramdedup", about = "CPU-for-RAM memory optimization daemon")]
@@ -211,34 +212,53 @@ async fn show_status(config_path: PathBuf) -> anyhow::Result<()> {
 
     let psi = zramdedup_common::psi::PsiStats::read_memory()?;
 
-    println!("=== zramdedup status ===");
-    println!();
-    println!("KSM Configuration:");
-    println!("  run:                    {}", cfg.run);
-    println!("  pages_to_scan:          {}", cfg.pages_to_scan);
-    println!("  sleep_millisecs:        {}", cfg.sleep_millisecs);
-    println!("  max_page_sharing:       {}", cfg.max_page_sharing);
-    println!("  advisor_mode:           {}", cfg.advisor_mode);
-    println!("  smart_scan:             {}", cfg.smart_scan);
-    println!();
-    println!("KSM Statistics:");
-    println!("  pages_shared:           {}", stats.pages_shared);
-    println!("  pages_sharing:          {}", stats.pages_sharing);
-    println!("  pages_unshared:         {}", stats.pages_unshared);
-    println!("  general_profit:         {}", stats.general_profit);
-    println!("  full_scans:             {}", stats.full_scans);
-    println!(
-        "  sharing_savings_mb:     {:.1}",
-        stats.pages_sharing as f64 * 4096.0 / 1024.0 / 1024.0
-    );
-    println!();
-    println!("Memory Pressure (PSI):");
-    println!("  some avg10:             {:.2}%", psi.some.avg10);
-    println!("  some avg60:             {:.2}%", psi.some.avg60);
-    println!("  full avg10:             {:.2}%", psi.full.avg10);
-    println!("  full avg60:             {:.2}%", psi.full.avg60);
+    print!("{}", format_status(&cfg, &stats, &psi));
 
     Ok(())
+}
+
+fn format_status(cfg: &KsmConfig, stats: &KsmStats, psi: &PsiStats) -> String {
+    format!(
+        "=== zramdedup status ===\n\
+         \n\
+         KSM Configuration:\n\
+           run:                    {}\n\
+           pages_to_scan:          {}\n\
+           sleep_millisecs:        {}\n\
+           max_page_sharing:       {}\n\
+           advisor_mode:           {}\n\
+           smart_scan:             {}\n\
+         \n\
+         KSM Statistics:\n\
+           pages_shared:           {}\n\
+           pages_sharing:          {}\n\
+           pages_unshared:         {}\n\
+           general_profit:         {}\n\
+           full_scans:             {}\n\
+           sharing_savings_mb:     {:.1}\n\
+         \n\
+         Memory Pressure (PSI):\n\
+           some avg10:             {:.2}%\n\
+           some avg60:             {:.2}%\n\
+           full avg10:             {:.2}%\n\
+           full avg60:             {:.2}%\n",
+        cfg.run,
+        cfg.pages_to_scan,
+        cfg.sleep_millisecs,
+        cfg.max_page_sharing,
+        cfg.advisor_mode,
+        cfg.smart_scan,
+        stats.pages_shared,
+        stats.pages_sharing,
+        stats.pages_unshared,
+        stats.general_profit,
+        stats.full_scans,
+        stats.pages_sharing as f64 * 4096.0 / 1024.0 / 1024.0,
+        psi.some.avg10,
+        psi.some.avg60,
+        psi.full.avg10,
+        psi.full.avg60,
+    )
 }
 
 async fn restore_ksm(config_path: PathBuf) -> anyhow::Result<()> {
@@ -260,18 +280,18 @@ fn init_tracing(log_level: &str) {
     // Try journald first, fall back to stderr
     match tracing_journald::layer() {
         Ok(_layer) => {
-            tracing_subscriber::fmt()
+            let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)
-                .init();
+                .try_init();
             // Note: journald layer is created but we use stderr writer for simplicity
             // In production, use tracing_subscriber::registry().with(layer).init()
         }
         Err(_) => {
-            tracing_subscriber::fmt()
+            let _ = tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_writer(std::io::stderr)
-                .init();
+                .try_init();
         }
     }
 }
@@ -299,5 +319,99 @@ mod tests {
         let config = load_config_or_default(&path).unwrap();
         assert_eq!(config.governor.stabilization_secs, 30);
         assert_eq!(config.general.log_level, "info");
+    }
+
+    #[test]
+    fn test_load_config_or_default_reads_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zramdedup.toml");
+        std::fs::write(
+            &path,
+            "[general]\nlog_level = \"debug\"\n\n[scanner]\nenabled = false\n",
+        )
+        .unwrap();
+
+        let config = load_config_or_default(&path).unwrap();
+        assert_eq!(config.general.log_level, "debug");
+        assert!(!config.scanner.enabled);
+    }
+
+    #[test]
+    fn test_format_status_contains_config_stats_and_psi() {
+        let cfg = KsmConfig {
+            run: 1,
+            pages_to_scan: 2000,
+            sleep_millisecs: 50,
+            max_page_sharing: 384,
+            smart_scan: 1,
+            advisor_mode: "scan-time".into(),
+            ..Default::default()
+        };
+        let stats = KsmStats {
+            pages_shared: 10,
+            pages_sharing: 512,
+            pages_unshared: 3,
+            general_profit: 12345,
+            full_scans: 7,
+            ..Default::default()
+        };
+        let psi = PsiStats {
+            some: zramdedup_common::psi::PsiLine {
+                avg10: 1.25,
+                avg60: 2.5,
+                ..Default::default()
+            },
+            full: zramdedup_common::psi::PsiLine {
+                avg10: 0.5,
+                avg60: 0.75,
+                ..Default::default()
+            },
+        };
+
+        let output = format_status(&cfg, &stats, &psi);
+        assert!(output.contains("advisor_mode:           scan-time"));
+        assert!(output.contains("pages_sharing:          512"));
+        assert!(output.contains("sharing_savings_mb:     2.0"));
+        assert!(output.contains("some avg10:             1.25%"));
+        assert!(output.contains("full avg60:             0.75%"));
+    }
+
+    #[test]
+    fn test_init_tracing_is_idempotent() {
+        init_tracing("debug");
+        init_tracing("info");
+    }
+
+    #[test]
+    fn test_cli_parses_run_status_and_restore_commands() {
+        let run = Cli::try_parse_from([
+            "zramdedup",
+            "run",
+            "--config",
+            "/tmp/zramdedup.toml",
+            "--dry-run",
+        ])
+        .unwrap();
+        match run.command {
+            Commands::Run { config, dry_run } => {
+                assert_eq!(config, PathBuf::from("/tmp/zramdedup.toml"));
+                assert!(dry_run);
+            }
+            _ => panic!("expected run command"),
+        }
+
+        let status =
+            Cli::try_parse_from(["zramdedup", "status", "--config", "/tmp/zramdedup.toml"])
+                .unwrap();
+        assert!(matches!(status.command, Commands::Status { .. }));
+
+        let restore = Cli::try_parse_from([
+            "zramdedup",
+            "restore-ksm",
+            "--config",
+            "/tmp/zramdedup.toml",
+        ])
+        .unwrap();
+        assert!(matches!(restore.command, Commands::RestoreKsm { .. }));
     }
 }

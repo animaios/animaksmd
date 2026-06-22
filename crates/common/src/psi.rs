@@ -5,7 +5,7 @@
 
 use crate::error::{Result, ZramdedupError};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const PSI_MEMORY_PATH: &str = "/proc/pressure/memory";
 
@@ -146,6 +146,7 @@ impl PsiStats {
 pub struct PsiTrigger {
     /// Owned file descriptor (closed on Drop).
     fd: std::os::unix::io::RawFd,
+    path: PathBuf,
     pub kind: PsiTriggerKind,
     pub threshold_us: u64,
     pub window_us: u64,
@@ -165,16 +166,27 @@ impl PsiTrigger {
     ///
     /// Window range: 500_000 to 10_000_000 (500ms to 10s).
     pub fn new(kind: PsiTriggerKind, threshold_us: u64, window_us: u64) -> Result<Self> {
+        Self::new_from_path(Path::new(PSI_MEMORY_PATH), kind, threshold_us, window_us)
+    }
+
+    /// Create a trigger using an explicit PSI path. This is primarily useful
+    /// for tests and cgroup PSI files.
+    pub fn new_from_path(
+        path: &Path,
+        kind: PsiTriggerKind,
+        threshold_us: u64,
+        window_us: u64,
+    ) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
 
-        // Open our own fd to /proc/pressure/memory with O_RDWR
+        // Open our own fd to the PSI file with O_RDWR.
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_RDWR)
-            .open(PSI_MEMORY_PATH)
+            .open(path)
             .map_err(|e| ZramdedupError::Sysfs {
-                path: Path::new(PSI_MEMORY_PATH).to_path_buf(),
+                path: path.to_path_buf(),
                 source: e,
             })?;
 
@@ -188,10 +200,11 @@ impl PsiTrigger {
         let trigger_str = format!("{kind_str} {threshold_us} {window_us}");
 
         // Write the trigger string to register with the kernel
-        Self::write_trigger(fd, &trigger_str)?;
+        Self::write_trigger_to_path(fd, &trigger_str, path)?;
 
         Ok(Self {
             fd,
+            path: path.to_path_buf(),
             kind,
             threshold_us,
             window_us,
@@ -205,7 +218,7 @@ impl PsiTrigger {
     /// the trigger must be re-written to fire again. This method
     /// re-writes the cached trigger string.
     pub fn rearm(&self) -> Result<()> {
-        Self::write_trigger(self.fd, &self.trigger_str)
+        Self::write_trigger_to_path(self.fd, &self.trigger_str, &self.path)
     }
 
     /// Get the raw fd for use with epoll/tokio.
@@ -214,7 +227,16 @@ impl PsiTrigger {
     }
 
     /// Internal: write trigger string to fd.
+    #[cfg(test)]
     fn write_trigger(fd: std::os::unix::io::RawFd, trigger_str: &str) -> Result<()> {
+        Self::write_trigger_to_path(fd, trigger_str, Path::new(PSI_MEMORY_PATH))
+    }
+
+    fn write_trigger_to_path(
+        fd: std::os::unix::io::RawFd,
+        trigger_str: &str,
+        path: &Path,
+    ) -> Result<()> {
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
 
@@ -223,7 +245,7 @@ impl PsiTrigger {
         let result = file
             .write_all(trigger_str.as_bytes())
             .map_err(|e| ZramdedupError::Sysfs {
-                path: Path::new(PSI_MEMORY_PATH).to_path_buf(),
+                path: path.to_path_buf(),
                 source: e,
             });
         // Don't drop the file — we don't own the fd.
@@ -429,5 +451,98 @@ mod tests {
         assert!(PressureLevel::Low < PressureLevel::Medium);
         assert!(PressureLevel::Medium < PressureLevel::High);
         assert!(PressureLevel::High < PressureLevel::Critical);
+    }
+
+    #[test]
+    fn test_read_from_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.pressure");
+        std::fs::write(
+            &path,
+            "some avg10=2.50 avg60=1.50 avg300=0.50 total=123\n\
+             full avg10=0.25 avg60=0.15 avg300=0.05 total=45\n",
+        )
+        .unwrap();
+
+        let stats = PsiStats::read_from(&path).unwrap();
+        assert!((stats.some.avg10 - 2.50).abs() < 0.001);
+        assert!((stats.full.avg60 - 0.15).abs() < 0.001);
+        assert_eq!(stats.some.total, 123);
+        assert_eq!(stats.full.total, 45);
+    }
+
+    #[test]
+    fn test_psi_trigger_new_from_path_writes_and_rearms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.pressure");
+        std::fs::write(&path, "").unwrap();
+
+        let trigger =
+            PsiTrigger::new_from_path(&path, PsiTriggerKind::Some, 1000, 500_000).expect("trigger");
+        assert_eq!(trigger.threshold_us, 1000);
+        assert_eq!(trigger.window_us, 500_000);
+        assert_eq!(trigger.as_raw_fd() >= 0, true);
+
+        trigger.rearm().unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("some 1000 500000"));
+        assert_eq!(content.matches("some 1000 500000").count(), 2);
+    }
+
+    #[test]
+    fn test_psi_trigger_full_kind_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.pressure");
+        std::fs::write(&path, "").unwrap();
+
+        let trigger = PsiTrigger::new_from_path(&path, PsiTriggerKind::Full, 2000, 1_000_000)
+            .expect("trigger");
+        drop(trigger);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "full 2000 1000000");
+    }
+
+    #[test]
+    fn test_psi_trigger_drop_closes_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.pressure");
+        std::fs::write(&path, "").unwrap();
+
+        let fd = {
+            let trigger =
+                PsiTrigger::new_from_path(&path, PsiTriggerKind::Some, 1000, 500_000).unwrap();
+            trigger.as_raw_fd()
+        };
+
+        let byte = b"x";
+        let ret = unsafe { libc::write(fd, byte.as_ptr().cast(), byte.len()) };
+        assert_eq!(ret, -1);
+        let errno = unsafe { *libc::__errno_location() };
+        assert_eq!(errno, libc::EBADF);
+    }
+
+    #[test]
+    fn test_write_trigger_reports_bad_fd() {
+        use std::os::unix::io::IntoRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.pressure");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        let fd = file.into_raw_fd();
+        unsafe {
+            libc::close(fd);
+        }
+
+        let err = PsiTrigger::write_trigger(fd, "some 1 500000").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Bad file descriptor") || message.contains("os error"));
     }
 }

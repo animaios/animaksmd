@@ -94,11 +94,7 @@ struct ProxyEngine {
 }
 
 impl ProxyEngine {
-    fn new(
-        store_path: &Path,
-        size_gb: u64,
-        max_entries: u64,
-    ) -> anyhow::Result<Self> {
+    fn new(store_path: &Path, size_gb: u64, max_entries: u64) -> anyhow::Result<Self> {
         let total_slots = (size_gb * 1024 * 1024 * 1024) / PAGE_SIZE as u64;
         let bloom_capacity = max_entries as usize;
 
@@ -150,9 +146,7 @@ impl ProxyEngine {
             dedup::LookupResult::Duplicate { backend_offset } => {
                 // Duplicate page! Just add a reference
                 self.dedup_table.add_reference(&fp);
-                self.stats
-                    .duplicate_writes
-                    .fetch_add(1, Ordering::Relaxed);
+                self.stats.duplicate_writes.fetch_add(1, Ordering::Relaxed);
 
                 // Update translation table
                 let mut xlat = self.translation.lock();
@@ -169,14 +163,11 @@ impl ProxyEngine {
                         let mut store = self.store.lock();
                         store.write_page(slot, data)?;
 
-                        self.stats
-                            .unique_writes
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.stats.unique_writes.fetch_add(1, Ordering::Relaxed);
 
                         let mut xlat = self.translation.lock();
                         if let Some(old_entry) = xlat.remove(virtual_offset) {
-                            self.dedup_table
-                                .remove_reference(&old_entry.fingerprint);
+                            self.dedup_table.remove_reference(&old_entry.fingerprint);
                         }
                         xlat.insert(virtual_offset, fp, slot);
                     }
@@ -185,9 +176,7 @@ impl ProxyEngine {
                         let slot = virtual_offset / PAGE_SIZE as u64;
                         let mut store = self.store.lock();
                         store.write_page(slot, data)?;
-                        self.stats
-                            .unique_writes
-                            .fetch_add(1, Ordering::Relaxed);
+                        self.stats.unique_writes.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -253,9 +242,15 @@ impl ProxyEngine {
         println!("Discards:               {discards}");
         println!();
         println!("Dedup Table:");
-        println!("  Unique pages tracked: {}", dedup_table_stats.table_entries);
+        println!(
+            "  Unique pages tracked: {}",
+            dedup_table_stats.table_entries
+        );
         println!("  Total unique seen:    {}", dedup_table_stats.unique_pages);
-        println!("  Duplicate hits:       {}", dedup_table_stats.duplicate_hits);
+        println!(
+            "  Duplicate hits:       {}",
+            dedup_table_stats.duplicate_hits
+        );
         println!("  Evictions:            {}", dedup_table_stats.evictions);
         println!(
             "  Bloom false positives: {}",
@@ -283,9 +278,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Cleanup => {
             info!("Cleaning up after proxy crash");
             // Ensure zram0 is still active as swap
-            let output = std::process::Command::new("swapon")
-                .arg("--show")
-                .output();
+            let output = std::process::Command::new("swapon").arg("--show").output();
             match output {
                 Ok(o) => {
                     let stdout = String::from_utf8_lossy(&o.stdout);
@@ -312,12 +305,11 @@ fn run_proxy(
     dry_run: bool,
 ) -> anyhow::Result<()> {
     // Initialize tracing
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -347,7 +339,13 @@ fn run_proxy(
         let page_b = vec![0xBBu8; PAGE_SIZE];
 
         for i in 0..100u64 {
-            let data = if i % 3 == 0 { &page_a } else if i % 3 == 1 { &page_b } else { &page_a };
+            let data = if i % 3 == 0 {
+                &page_a
+            } else if i % 3 == 1 {
+                &page_b
+            } else {
+                &page_a
+            };
             let offset = i * PAGE_SIZE as u64;
             engine.handle_write(offset, data)?;
         }
@@ -392,8 +390,14 @@ fn run_dry_run_simulation(
     }
 
     info!(
-        total = engine.stats.total_writes.load(std::sync::atomic::Ordering::Relaxed),
-        deduped = engine.stats.duplicate_writes.load(std::sync::atomic::Ordering::Relaxed),
+        total = engine
+            .stats
+            .total_writes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        deduped = engine
+            .stats
+            .duplicate_writes
+            .load(std::sync::atomic::Ordering::Relaxed),
         "Phase 1 complete (passthrough — zero dedup overhead)"
     );
 
@@ -424,4 +428,161 @@ fn run_dry_run_simulation(
 
     info!("Dry-run simulation complete (opportunistic mode demonstrated)");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn engine_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("pagestore.dat");
+        (dir, path)
+    }
+
+    #[test]
+    fn test_proxy_stats_new_zeroes() {
+        let stats = ProxyStats::new();
+        assert_eq!(stats.total_writes.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.unique_writes.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.duplicate_writes.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.total_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.discards.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_proxy_engine_new_creates_store_parent_directory() {
+        let (_dir, path) = engine_path();
+
+        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+
+        assert!(path.exists());
+        assert!(engine.passthrough.load(Ordering::Relaxed));
+        assert_eq!(
+            engine.store.lock().total_slots(),
+            (1024 * 1024 * 1024) / PAGE_SIZE as u64
+        );
+    }
+
+    #[test]
+    fn test_cli_parses_run_stats_and_cleanup_commands() {
+        let run = Cli::try_parse_from([
+            "zramdedup-swap-proxy",
+            "run",
+            "--store-path",
+            "/tmp/store.dat",
+            "--size-gb",
+            "2",
+            "--max-entries",
+            "42",
+            "--dry-run",
+        ])
+        .unwrap();
+        match run.command {
+            Commands::Run {
+                store_path,
+                size_gb,
+                max_entries,
+                dry_run,
+            } => {
+                assert_eq!(store_path, PathBuf::from("/tmp/store.dat"));
+                assert_eq!(size_gb, 2);
+                assert_eq!(max_entries, 42);
+                assert!(dry_run);
+            }
+            _ => panic!("expected run command"),
+        }
+
+        let stats = Cli::try_parse_from([
+            "zramdedup-swap-proxy",
+            "stats",
+            "--store-path",
+            "/tmp/store.dat",
+        ])
+        .unwrap();
+        assert!(matches!(stats.command, Commands::Stats { .. }));
+
+        let cleanup = Cli::try_parse_from(["zramdedup-swap-proxy", "cleanup"]).unwrap();
+        assert!(matches!(cleanup.command, Commands::Cleanup));
+    }
+
+    #[test]
+    fn test_handle_write_passthrough_writes_direct_slot_and_counts_unique() {
+        let (_dir, path) = engine_path();
+        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let page = vec![0xAA; PAGE_SIZE];
+
+        engine.handle_write(PAGE_SIZE as u64, &page).unwrap();
+        let read = engine.handle_read(PAGE_SIZE as u64).unwrap();
+
+        assert_eq!(read, page);
+        assert_eq!(engine.stats.total_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.stats.unique_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.stats.duplicate_writes.load(Ordering::Relaxed), 0);
+        assert_eq!(engine.stats.total_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.translation.lock().len(), 0);
+    }
+
+    #[test]
+    fn test_handle_write_dedup_mode_records_duplicate_translation() {
+        let (_dir, path) = engine_path();
+        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        engine.passthrough.store(false, Ordering::Relaxed);
+        let page = vec![0xAB; PAGE_SIZE];
+
+        engine.handle_write(0, &page).unwrap();
+        engine.handle_write(PAGE_SIZE as u64, &page).unwrap();
+
+        assert_eq!(engine.stats.total_writes.load(Ordering::Relaxed), 2);
+        assert_eq!(engine.stats.unique_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.stats.duplicate_writes.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.translation.lock().len(), 2);
+
+        let read = engine.handle_read(PAGE_SIZE as u64).unwrap();
+        assert_eq!(read, page);
+
+        let dedup_stats = engine.dedup_table.stats();
+        assert_eq!(dedup_stats.table_entries, 1);
+        assert_eq!(dedup_stats.duplicate_hits, 1);
+    }
+
+    #[test]
+    fn test_handle_write_replaces_old_translation_and_removes_reference() {
+        let (_dir, path) = engine_path();
+        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        engine.passthrough.store(false, Ordering::Relaxed);
+        let page_a = vec![0xAA; PAGE_SIZE];
+        let page_b = vec![0xBB; PAGE_SIZE];
+
+        engine.handle_write(0, &page_a).unwrap();
+        engine.handle_write(0, &page_b).unwrap();
+
+        let read = engine.handle_read(0).unwrap();
+        assert_eq!(read, page_b);
+        assert_eq!(engine.translation.lock().len(), 1);
+        assert_eq!(engine.dedup_table.stats().table_entries, 1);
+    }
+
+    #[test]
+    fn test_handle_discard_removes_translation_and_counts_discard() {
+        let (_dir, path) = engine_path();
+        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        engine.passthrough.store(false, Ordering::Relaxed);
+        let page = vec![0xCC; PAGE_SIZE];
+
+        engine.handle_write(0, &page).unwrap();
+        assert_eq!(engine.translation.lock().len(), 1);
+
+        engine.handle_discard(0);
+
+        assert_eq!(engine.stats.discards.load(Ordering::Relaxed), 1);
+        assert_eq!(engine.translation.lock().len(), 0);
+        assert_eq!(engine.dedup_table.stats().table_entries, 0);
+    }
+
+    #[test]
+    fn test_run_proxy_dry_run_simulation_completes() {
+        let (_dir, path) = engine_path();
+        run_proxy(path, 1, 2048, true).unwrap();
+    }
 }

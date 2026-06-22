@@ -115,7 +115,41 @@ pub fn apply_mergeable(
         return result;
     }
 
-    // Process in chunks of MAX_IOV_BATCH
+    apply_madvise_batches(
+        pid,
+        &mut result,
+        &batch,
+        |iovs| process_madvise_batch(pidfd, iovs, MADV_MERGEABLE),
+        |addr, len| process_madvise_single(pidfd, addr, len, MADV_MERGEABLE),
+    );
+
+    // Close pidfd
+    unsafe {
+        libc::close(pidfd);
+    }
+
+    if result.regions_merged > 0 {
+        info!(
+            pid,
+            regions_merged = result.regions_merged,
+            total_kb = result.total_bytes_marked / 1024,
+            "Applied batched MADV_MERGEABLE to process regions"
+        );
+    }
+
+    result
+}
+
+fn apply_madvise_batches<BatchFn, SingleFn>(
+    pid: u32,
+    result: &mut MadviseResult,
+    batch: &[(u64, usize)],
+    mut batch_call: BatchFn,
+    mut single_call: SingleFn,
+) where
+    BatchFn: FnMut(&[libc::iovec]) -> Result<u64, String>,
+    SingleFn: FnMut(u64, usize) -> Result<(), String>,
+{
     for chunk in batch.chunks(MAX_IOV_BATCH) {
         let iovs: Vec<libc::iovec> = chunk
             .iter()
@@ -127,7 +161,7 @@ pub fn apply_mergeable(
 
         let total_chunk_bytes: u64 = chunk.iter().map(|&(_, len)| len as u64).sum();
 
-        match process_madvise_batch(pidfd, &iovs, MADV_MERGEABLE) {
+        match batch_call(&iovs) {
             Ok(bytes_processed) => {
                 if bytes_processed == total_chunk_bytes {
                     // All regions processed successfully
@@ -164,7 +198,7 @@ pub fn apply_mergeable(
                     "Batched madvise failed, falling back to per-region"
                 );
                 for &(addr, len) in chunk {
-                    match process_madvise_single(pidfd, addr, len, MADV_MERGEABLE) {
+                    match single_call(addr, len) {
                         Ok(_) => {
                             result.regions_merged += 1;
                             result.total_bytes_marked += len as u64;
@@ -179,22 +213,6 @@ pub fn apply_mergeable(
             }
         }
     }
-
-    // Close pidfd
-    unsafe {
-        libc::close(pidfd);
-    }
-
-    if result.regions_merged > 0 {
-        info!(
-            pid,
-            regions_merged = result.regions_merged,
-            total_kb = result.total_bytes_marked / 1024,
-            "Applied batched MADV_MERGEABLE to process regions"
-        );
-    }
-
-    result
 }
 
 /// Opportunistically collapse memory regions into transparent huge pages.
@@ -636,6 +654,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_apply_mergeable_returns_zero_when_no_regions_are_eligible() {
+        let result = apply_mergeable(
+            std::process::id(),
+            &[MapsEntry {
+                start: 0x10000,
+                end: 0x11000,
+                perms: "r-xp".into(),
+                offset: 0,
+                dev: "00:00".into(),
+                inode: 0,
+                pathname: String::new(),
+            }],
+            4096,
+            true,
+        );
+
+        assert_eq!(result.regions_attempted, 0);
+        assert_eq!(result.regions_merged, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_collapse_regions_returns_zero_without_large_eligible_regions() {
+        let collapsed = collapse_regions(
+            std::process::id(),
+            &[MapsEntry {
+                start: 0x10000,
+                end: 0x11000,
+                perms: "rw-p".into(),
+                offset: 0,
+                dev: "00:00".into(),
+                inode: 0,
+                pathname: String::new(),
+            }],
+        );
+
+        assert_eq!(collapsed, 0);
+    }
+
     // ── batch_apply_mergeable ───────────────────────────────────────────
 
     #[test]
@@ -661,7 +719,9 @@ mod tests {
         assert_eq!(results[&my_pid].regions_merged, 1);
         // Second PID doesn't exist → pidfd_open fails, 0 merged
         assert_eq!(results[&other_pid].regions_merged, 0);
-        assert!(results[&other_pid].errors[0].1.contains("pidfd_open failed"));
+        assert!(results[&other_pid].errors[0]
+            .1
+            .contains("pidfd_open failed"));
     }
 
     // ── MadviseResult ───────────────────────────────────────────────────
@@ -691,5 +751,91 @@ mod tests {
         };
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.regions_merged, 1);
+    }
+
+    #[test]
+    fn test_apply_madvise_batches_counts_full_batch_success() {
+        let mut result = MadviseResult {
+            pid: 123,
+            regions_attempted: 2,
+            regions_merged: 0,
+            total_bytes_marked: 0,
+            errors: vec![],
+        };
+        let batch = vec![(0x1000, 4096), (0x2000, 8192)];
+
+        apply_madvise_batches(
+            123,
+            &mut result,
+            &batch,
+            |_| Ok(12_288),
+            |_, _| panic!("single fallback should not run"),
+        );
+
+        assert_eq!(result.regions_merged, 2);
+        assert_eq!(result.total_bytes_marked, 12_288);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_apply_madvise_batches_counts_partial_batch_success() {
+        let mut result = MadviseResult {
+            pid: 123,
+            regions_attempted: 2,
+            regions_merged: 0,
+            total_bytes_marked: 0,
+            errors: vec![],
+        };
+        let batch = vec![(0x1000, 4096), (0x2000, 8192)];
+
+        apply_madvise_batches(
+            123,
+            &mut result,
+            &batch,
+            |_| Ok(4096),
+            |_, _| panic!("single fallback should not run"),
+        );
+
+        assert_eq!(result.regions_merged, 2);
+        assert_eq!(result.total_bytes_marked, 4096);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_apply_madvise_batches_falls_back_per_region_after_batch_failure() {
+        let mut result = MadviseResult {
+            pid: 123,
+            regions_attempted: 3,
+            regions_merged: 0,
+            total_bytes_marked: 0,
+            errors: vec![],
+        };
+        let batch = vec![(0x1000, 4096), (0x2000, 8192), (0x3000, 4096)];
+
+        apply_madvise_batches(
+            123,
+            &mut result,
+            &batch,
+            |_| Err("forced batch failure".into()),
+            |addr, _len| {
+                if addr == 0x2000 {
+                    Err("forced single failure".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+
+        assert_eq!(result.regions_merged, 2);
+        assert_eq!(result.total_bytes_marked, 8192);
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].0, 0x2000);
+        assert!(result.errors[0].1.contains("forced single failure"));
+    }
+
+    #[test]
+    fn test_errno_to_str_known_and_unknown() {
+        assert!(errno_to_str(libc::EPERM).contains("EPERM"));
+        assert_eq!(errno_to_str(999_999), "unknown");
     }
 }

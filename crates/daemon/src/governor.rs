@@ -24,7 +24,7 @@ use tokio::sync::watch;
 use tokio::time;
 use tracing::{debug, info, warn};
 use zramdedup_common::config::GovernorConfig;
-use zramdedup_common::ksm::KsmController;
+use zramdedup_common::ksm::{KsmController, KsmStats};
 use zramdedup_common::psi::{PressureLevel, PsiStats};
 use zramdedup_common::SharedGovernorState;
 
@@ -172,18 +172,6 @@ impl Governor {
             }
         };
 
-        // PSI stability tracking (for drift detection)
-        if let Some(ref prev) = self.last_psi {
-            let some_diff = (psi.some.avg10 - prev.some.avg10).abs();
-            let full_diff = (psi.full.avg10 - prev.full.avg10).abs();
-            if some_diff < 0.5 && full_diff < 0.5 {
-                self.stable_psi_ticks += 1;
-            } else {
-                self.stable_psi_ticks = 0;
-            }
-        }
-        self.last_psi = Some(psi.clone());
-
         // Read current KSM stats
         let ksm_stats = match self.ksm.read_stats() {
             Ok(s) => s,
@@ -192,6 +180,17 @@ impl Governor {
                 return;
             }
         };
+
+        self.tick_with_readings(state, psi, ksm_stats).await;
+    }
+
+    async fn tick_with_readings(
+        &mut self,
+        state: &SharedGovernorState,
+        psi: PsiStats,
+        ksm_stats: KsmStats,
+    ) {
+        self.observe_psi_stability(&psi);
 
         // Classify pressure
         let pressure = psi.classify(
@@ -260,6 +259,20 @@ impl Governor {
             stable_psi_ticks = self.stable_psi_ticks,
             "Governor tick"
         );
+    }
+
+    fn observe_psi_stability(&mut self, psi: &PsiStats) {
+        // PSI stability tracking (for drift detection)
+        if let Some(ref prev) = self.last_psi {
+            let some_diff = (psi.some.avg10 - prev.some.avg10).abs();
+            let full_diff = (psi.full.avg10 - prev.full.avg10).abs();
+            if some_diff < 0.5 && full_diff < 0.5 {
+                self.stable_psi_ticks += 1;
+            } else {
+                self.stable_psi_ticks = 0;
+            }
+        }
+        self.last_psi = Some(psi.clone());
     }
 
     /// Map pressure level to KSM aggressiveness level (0-5).
@@ -378,6 +391,40 @@ mod tests {
         let mut ksm = KsmController::new("/sys/kernel/mm/ksm").unwrap();
         ksm.set_dry_run(true);
         Governor::new(config, ksm)
+    }
+
+    fn make_temp_gov_with(f: impl FnOnce(&mut GovernorConfig)) -> Governor {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.keep();
+        let mut config = GovernorConfig::default();
+        config.ksm_path = path.to_string_lossy().to_string();
+        f(&mut config);
+        let mut ksm = KsmController::new(&config.ksm_path).unwrap();
+        ksm.set_dry_run(true);
+        Governor::new(config, ksm)
+    }
+
+    fn psi(some_avg10: f32, full_avg10: f32) -> PsiStats {
+        PsiStats {
+            some: zramdedup_common::psi::PsiLine {
+                avg10: some_avg10,
+                ..Default::default()
+            },
+            full: zramdedup_common::psi::PsiLine {
+                avg10: full_avg10,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn ksm_stats(pages_sharing: u64, general_profit: i64, full_scans: u64) -> KsmStats {
+        KsmStats {
+            pages_shared: pages_sharing / 2,
+            pages_sharing,
+            general_profit,
+            full_scans,
+            ..Default::default()
+        }
     }
 
     // ── Initial state ────────────────────────────────────────────────
@@ -662,5 +709,82 @@ mod tests {
         // Going to level 0 (Idle) should be fine
         gov.apply_profile(0, &state).await;
         assert_eq!(gov.current_level, 0);
+    }
+
+    #[test]
+    fn test_observe_psi_stability_counts_stable_and_resets_on_jump() {
+        let mut gov = make_temp_gov_with(|_| {});
+
+        gov.observe_psi_stability(&psi(1.0, 0.5));
+        assert_eq!(gov.stable_psi_ticks, 0);
+
+        gov.observe_psi_stability(&psi(1.2, 0.7));
+        assert_eq!(gov.stable_psi_ticks, 1);
+
+        gov.observe_psi_stability(&psi(3.0, 0.7));
+        assert_eq!(gov.stable_psi_ticks, 0);
+    }
+
+    #[tokio::test]
+    async fn test_tick_with_readings_applies_profile_and_updates_shared_state() {
+        let mut gov = make_temp_gov_with(|c| {
+            c.stabilization_secs = 30;
+            c.min_level_duration_secs = 0;
+        });
+        let state = new_shared_state();
+        {
+            let mut s = state.write().await;
+            s.last_governor_action = Instant::now() - Duration::from_secs(31);
+        }
+
+        gov.tick_with_readings(&state, psi(30.0, 25.0), ksm_stats(1234, 5678, 9))
+            .await;
+
+        assert_eq!(gov.current_level, 5);
+        let s = state.read().await;
+        assert_eq!(s.current_pressure, PressureLevel::Critical);
+        assert_eq!(s.ksm_level, 5);
+        assert_eq!(s.pages_sharing, 1234);
+        assert_eq!(s.general_profit, 5678);
+        assert!(s.last_governor_action.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_tick_with_readings_defers_profile_inside_stabilization_window() {
+        let mut gov = make_temp_gov_with(|c| c.stabilization_secs = 30);
+        let state = new_shared_state();
+        {
+            let mut s = state.write().await;
+            s.last_governor_action = Instant::now();
+        }
+
+        gov.tick_with_readings(&state, psi(30.0, 25.0), ksm_stats(10, 20, 1))
+            .await;
+
+        assert_eq!(gov.current_level, 0);
+        let s = state.read().await;
+        assert_eq!(s.current_pressure, PressureLevel::Critical);
+        assert_eq!(s.ksm_level, 0);
+        assert_eq!(s.pages_sharing, 10);
+        assert_eq!(s.general_profit, 20);
+    }
+
+    #[tokio::test]
+    async fn test_tick_with_readings_reduces_level_on_sustained_negative_profit() {
+        let mut gov = make_temp_gov_with(|c| {
+            c.stabilization_secs = 0;
+            c.min_level_duration_secs = 0;
+        });
+        let state = new_shared_state();
+        gov.current_level = 4;
+        gov.full_scans_at_level = 1;
+
+        gov.tick_with_readings(&state, psi(12.0, 8.0), ksm_stats(10, -50, 20))
+            .await;
+
+        assert_eq!(gov.current_level, 3);
+        let s = state.read().await;
+        assert_eq!(s.ksm_level, 3);
+        assert_eq!(s.general_profit, -50);
     }
 }

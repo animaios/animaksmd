@@ -5,6 +5,7 @@
 
 use crate::error::{Result, ZramdedupError};
 use std::fs;
+use std::path::Path;
 
 /// Process memory status from /proc/PID/status.
 #[derive(Debug, Clone, Default)]
@@ -85,10 +86,14 @@ pub struct MergeCandidate {
 
 /// List all PIDs in /proc (numeric directory entries).
 pub fn list_pids() -> Result<Vec<u32>> {
+    list_pids_from(Path::new("/proc"))
+}
+
+fn list_pids_from(proc_path: &Path) -> Result<Vec<u32>> {
     let mut pids = Vec::new();
-    let entries = fs::read_dir("/proc").map_err(|e| ZramdedupError::Procfs {
+    let entries = fs::read_dir(proc_path).map_err(|e| ZramdedupError::Procfs {
         pid: 0,
-        detail: format!("cannot read /proc: {e}"),
+        detail: format!("cannot read {}: {e}", proc_path.display()),
     })?;
 
     for entry in entries.flatten() {
@@ -104,10 +109,14 @@ pub fn list_pids() -> Result<Vec<u32>> {
 
 /// Read process status (VmRSS, VmAnon, etc.) from /proc/PID/status.
 pub fn read_process_status(pid: u32) -> Result<ProcessStatus> {
-    let path = format!("/proc/{pid}/status");
+    read_process_status_from(Path::new("/proc"), pid)
+}
+
+fn read_process_status_from(proc_path: &Path, pid: u32) -> Result<ProcessStatus> {
+    let path = proc_path.join(pid.to_string()).join("status");
     let content = fs::read_to_string(&path).map_err(|e| ZramdedupError::Procfs {
         pid,
-        detail: format!("cannot read {path}: {e}"),
+        detail: format!("cannot read {}: {e}", path.display()),
     })?;
 
     let mut status = ProcessStatus {
@@ -132,10 +141,14 @@ pub fn read_process_status(pid: u32) -> Result<ProcessStatus> {
 
 /// Read and parse /proc/PID/maps.
 pub fn read_process_maps(pid: u32) -> Result<Vec<MapsEntry>> {
-    let path = format!("/proc/{pid}/maps");
+    read_process_maps_from(Path::new("/proc"), pid)
+}
+
+fn read_process_maps_from(proc_path: &Path, pid: u32) -> Result<Vec<MapsEntry>> {
+    let path = proc_path.join(pid.to_string()).join("maps");
     let content = fs::read_to_string(&path).map_err(|e| ZramdedupError::Procfs {
         pid,
-        detail: format!("cannot read {path}: {e}"),
+        detail: format!("cannot read {}: {e}", path.display()),
     })?;
 
     let mut entries = Vec::new();
@@ -150,10 +163,14 @@ pub fn read_process_maps(pid: u32) -> Result<Vec<MapsEntry>> {
 
 /// Read per-process KSM statistics from /proc/PID/ksm_stat.
 pub fn read_ksm_stat(pid: u32) -> Result<KsmProcStat> {
-    let path = format!("/proc/{pid}/ksm_stat");
+    read_ksm_stat_from(Path::new("/proc"), pid)
+}
+
+fn read_ksm_stat_from(proc_path: &Path, pid: u32) -> Result<KsmProcStat> {
+    let path = proc_path.join(pid.to_string()).join("ksm_stat");
     let content = fs::read_to_string(&path).map_err(|e| ZramdedupError::Procfs {
         pid,
-        detail: format!("cannot read {path}: {e}"),
+        detail: format!("cannot read {}: {e}", path.display()),
     })?;
 
     let mut stat = KsmProcStat::default();
@@ -194,13 +211,17 @@ pub fn read_cgroup_procs(cgroup_path: &str) -> Result<Vec<u32>> {
 /// Read a pagemap entry for a given virtual address.
 /// Returns the PFN (page frame number) if the page is present.
 pub fn read_pagemap_pfn(pid: u32, vaddr: u64) -> Result<Option<u64>> {
-    let path = format!("/proc/{pid}/pagemap");
+    read_pagemap_pfn_from(Path::new("/proc"), pid, vaddr)
+}
+
+fn read_pagemap_pfn_from(proc_path: &Path, pid: u32, vaddr: u64) -> Result<Option<u64>> {
+    let path = proc_path.join(pid.to_string()).join("pagemap");
     let offset = (vaddr / 4096) * 8; // 8 bytes per page
 
     use std::io::{Read, Seek, SeekFrom};
     let mut file = fs::File::open(&path).map_err(|e| ZramdedupError::Procfs {
         pid,
-        detail: format!("cannot open {path}: {e}"),
+        detail: format!("cannot open {}: {e}", path.display()),
     })?;
 
     file.seek(SeekFrom::Start(offset))
@@ -231,7 +252,11 @@ pub fn read_pagemap_pfn(pid: u32, vaddr: u64) -> Result<Option<u64>> {
 
 /// Read PFNs for all pages in a memory range.
 pub fn read_pagemap_range(pid: u32, start: u64, end: u64) -> Result<Vec<u64>> {
-    let path = format!("/proc/{pid}/pagemap");
+    read_pagemap_range_from(Path::new("/proc"), pid, start, end)
+}
+
+fn read_pagemap_range_from(proc_path: &Path, pid: u32, start: u64, end: u64) -> Result<Vec<u64>> {
+    let path = proc_path.join(pid.to_string()).join("pagemap");
     let mut pfns = Vec::new();
 
     use std::io::{Read, Seek, SeekFrom};
@@ -240,7 +265,7 @@ pub fn read_pagemap_range(pid: u32, start: u64, end: u64) -> Result<Vec<u64>> {
         Err(e) => {
             return Err(ZramdedupError::Procfs {
                 pid,
-                detail: format!("cannot open {path}: {e}"),
+                detail: format!("cannot open {}: {e}", path.display()),
             });
         }
     };
@@ -289,12 +314,16 @@ pub fn is_blocklisted(name: &str, blocklist: &[String]) -> bool {
 
 /// Get the comm (short name) of a process.
 pub fn read_process_comm(pid: u32) -> Result<String> {
-    let path = format!("/proc/{pid}/comm");
+    read_process_comm_from(Path::new("/proc"), pid)
+}
+
+fn read_process_comm_from(proc_path: &Path, pid: u32) -> Result<String> {
+    let path = proc_path.join(pid.to_string()).join("comm");
     fs::read_to_string(&path)
         .map(|s| s.trim().to_string())
         .map_err(|e| ZramdedupError::Procfs {
             pid,
-            detail: format!("cannot read {path}: {e}"),
+            detail: format!("cannot read {}: {e}", path.display()),
         })
 }
 
@@ -641,5 +670,137 @@ mod tests {
         assert_eq!(mc.pid, 100);
         assert_eq!(mc.size_bytes, 65536);
         assert_eq!(mc.anon_rss_kb, 64);
+    }
+
+    // ── file-backed /proc helpers ───────────────────────────────────────
+
+    fn proc_pid(root: &Path, pid: u32) -> std::path::PathBuf {
+        let path = root.join(pid.to_string());
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_list_pids_from_temp_proc_only_numeric_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("1")).unwrap();
+        std::fs::create_dir(dir.path().join("42")).unwrap();
+        std::fs::create_dir(dir.path().join("self")).unwrap();
+        std::fs::write(dir.path().join("meminfo"), "").unwrap();
+
+        let mut pids = list_pids_from(dir.path()).unwrap();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![1, 42]);
+    }
+
+    #[test]
+    fn test_read_process_status_from_temp_proc() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 123);
+        std::fs::write(
+            pid_dir.join("status"),
+            "Name:\tfirefox\nVmRSS:\t  204800 kB\nVmAnon:\t  102400 kB\nVmSwap:\t  4096 kB\n",
+        )
+        .unwrap();
+
+        let status = read_process_status_from(dir.path(), 123).unwrap();
+        assert_eq!(status.pid, 123);
+        assert_eq!(status.name, "firefox");
+        assert_eq!(status.vm_rss_kb, 204800);
+        assert_eq!(status.vm_anon_kb, 102400);
+        assert_eq!(status.vm_swap_kb, 4096);
+    }
+
+    #[test]
+    fn test_read_process_maps_from_temp_proc_skips_bad_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 123);
+        std::fs::write(
+            pid_dir.join("maps"),
+            "not-enough-fields\n\
+             1000-3000 rw-p 00000000 00:00 0\n\
+             4000-5000 r--p 00000000 08:01 99 /tmp/file with spaces\n",
+        )
+        .unwrap();
+
+        let maps = read_process_maps_from(dir.path(), 123).unwrap();
+        assert_eq!(maps.len(), 2);
+        assert_eq!(maps[0].start, 0x1000);
+        assert!(maps[0].is_anon_rw());
+        assert_eq!(maps[1].pathname, "/tmp/file with spaces");
+    }
+
+    #[test]
+    fn test_read_ksm_stat_from_temp_proc() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 123);
+        std::fs::write(
+            pid_dir.join("ksm_stat"),
+            "ksm_rmap_items 10\n\
+             ksm_merging_pages 3\n\
+             ksm_process_profit -7\n\
+             ksm_merge_any yes\n\
+             ksm_mergeable 1\n\
+             ignored 999\n",
+        )
+        .unwrap();
+
+        let stat = read_ksm_stat_from(dir.path(), 123).unwrap();
+        assert_eq!(stat.rmap_items, 10);
+        assert_eq!(stat.merging_pages, 3);
+        assert_eq!(stat.process_profit, -7);
+        assert!(stat.merge_any);
+        assert!(stat.mergeable);
+    }
+
+    #[test]
+    fn test_read_cgroup_procs_ignores_invalid_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "10\nbad\n20\n\n").unwrap();
+
+        let pids = read_cgroup_procs(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(pids, vec![10, 20]);
+    }
+
+    #[test]
+    fn test_read_pagemap_pfn_from_temp_proc_present_and_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 123);
+        let present = (1u64 << 63) | 0x12345;
+        let absent = 0x54321u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&present.to_ne_bytes());
+        bytes.extend_from_slice(&absent.to_ne_bytes());
+        std::fs::write(pid_dir.join("pagemap"), bytes).unwrap();
+
+        assert_eq!(
+            read_pagemap_pfn_from(dir.path(), 123, 0).unwrap(),
+            Some(0x12345)
+        );
+        assert_eq!(read_pagemap_pfn_from(dir.path(), 123, 4096).unwrap(), None);
+    }
+
+    #[test]
+    fn test_read_pagemap_range_from_temp_proc_filters_zero_and_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 123);
+        let entries = [(1u64 << 63) | 0x111, 0, 1u64 << 63, (1u64 << 63) | 0x222];
+        let mut bytes = Vec::new();
+        for entry in entries {
+            bytes.extend_from_slice(&entry.to_ne_bytes());
+        }
+        std::fs::write(pid_dir.join("pagemap"), bytes).unwrap();
+
+        let pfns = read_pagemap_range_from(dir.path(), 123, 0, 4 * 4096).unwrap();
+        assert_eq!(pfns, vec![0x111, 0x222]);
+    }
+
+    #[test]
+    fn test_read_process_comm_from_temp_proc_trims_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 123);
+        std::fs::write(pid_dir.join("comm"), "worker\n").unwrap();
+
+        assert_eq!(read_process_comm_from(dir.path(), 123).unwrap(), "worker");
     }
 }

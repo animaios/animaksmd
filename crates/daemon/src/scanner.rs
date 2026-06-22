@@ -24,7 +24,7 @@ use tokio::sync::watch;
 use tokio::time;
 use tracing::{debug, info, warn};
 use zramdedup_common::config::ScannerConfig;
-use zramdedup_common::procfs;
+use zramdedup_common::procfs::{self, KsmProcStat, MapsEntry, ProcessStatus};
 use zramdedup_common::SharedGovernorState;
 
 use crate::madvise;
@@ -48,6 +48,50 @@ struct Candidate {
     pid: u32,
     name: String,
     anon_rss_mb: u64,
+}
+
+fn l1_candidate_from_status(status: ProcessStatus, config: &ScannerConfig) -> Option<Candidate> {
+    if status.pid <= 2 {
+        return None;
+    }
+
+    if procfs::is_blocklisted(&status.name, &config.blocklist) {
+        return None;
+    }
+
+    let anon_rss_mb = status.vm_anon_kb / 1024;
+    if anon_rss_mb < config.min_anon_rss_mb {
+        return None;
+    }
+
+    Some(Candidate {
+        pid: status.pid,
+        name: status.name,
+        anon_rss_mb,
+    })
+}
+
+fn passes_l2_already_merged_filter(ksm_stat: Option<&KsmProcStat>) -> bool {
+    !ksm_stat.map(|s| s.merge_any).unwrap_or(false)
+}
+
+fn passes_l25_profit_filter(ksm_stat: Option<&KsmProcStat>) -> bool {
+    ksm_stat.map(|s| s.process_profit >= 0).unwrap_or(true)
+}
+
+fn eligible_anon_rw_summary(maps: &[MapsEntry]) -> (usize, u64) {
+    let eligible = maps
+        .iter()
+        .filter(|m| m.is_anon_rw() && !m.has_exec() && !m.is_special());
+
+    let mut count = 0;
+    let mut bytes = 0;
+    for map in eligible {
+        count += 1;
+        bytes += map.size();
+    }
+
+    (count, bytes)
 }
 
 /// The process scanner.
@@ -133,29 +177,14 @@ impl Scanner {
         let mut l1_candidates: Vec<Candidate> = Vec::new();
 
         for pid in pids {
-            if pid <= 2 {
-                continue;
-            }
-
             let status = match procfs::read_process_status(pid) {
                 Ok(s) => s,
                 Err(_) => continue,
             };
 
-            if procfs::is_blocklisted(&status.name, &self.config.blocklist) {
-                continue;
+            if let Some(candidate) = l1_candidate_from_status(status, &self.config) {
+                l1_candidates.push(candidate);
             }
-
-            let anon_mb = status.vm_anon_kb / 1024;
-            if anon_mb < self.config.min_anon_rss_mb {
-                continue;
-            }
-
-            l1_candidates.push(Candidate {
-                pid,
-                name: status.name,
-                anon_rss_mb: anon_mb,
-            });
         }
 
         self.stats.processes_filtered_l1 += l1_candidates.len() as u64;
@@ -169,10 +198,9 @@ impl Scanner {
         let mut l2_candidates: Vec<Candidate> = Vec::new();
 
         for candidate in l1_candidates {
-            if let Ok(ksm_stat) = procfs::read_ksm_stat(candidate.pid) {
-                if ksm_stat.merge_any {
-                    continue; // Already KSM-enabled
-                }
+            let ksm_stat = procfs::read_ksm_stat(candidate.pid).ok();
+            if !passes_l2_already_merged_filter(ksm_stat.as_ref()) {
+                continue; // Already KSM-enabled
             }
             l2_candidates.push(candidate);
         }
@@ -190,16 +218,15 @@ impl Scanner {
         let mut l25_candidates: Vec<Candidate> = Vec::new();
 
         for candidate in l2_candidates {
-            if let Ok(ksm_stat) = procfs::read_ksm_stat(candidate.pid) {
-                if ksm_stat.process_profit < 0 {
-                    self.stats.processes_filtered_l25_profit += 1;
-                    debug!(
-                        pid = candidate.pid,
-                        profit = ksm_stat.process_profit,
-                        "Skipped: KSM reports negative process profit"
-                    );
-                    continue;
-                }
+            let ksm_stat = procfs::read_ksm_stat(candidate.pid).ok();
+            if !passes_l25_profit_filter(ksm_stat.as_ref()) {
+                self.stats.processes_filtered_l25_profit += 1;
+                debug!(
+                    pid = candidate.pid,
+                    profit = ksm_stat.map(|s| s.process_profit).unwrap_or_default(),
+                    "Skipped: KSM reports negative process profit"
+                );
+                continue;
             }
             l25_candidates.push(candidate);
         }
@@ -222,29 +249,18 @@ impl Scanner {
                 Err(_) => continue,
             };
 
-            let anon_rw_count = maps
-                .iter()
-                .filter(|m| m.is_anon_rw() && !m.has_exec() && !m.is_special())
-                .count();
+            let (anon_rw_count, total_anon_rw_bytes) = eligible_anon_rw_summary(&maps);
 
             if anon_rw_count == 0 {
                 continue;
             }
-
-            let total_anon_rw_mb: u64 = maps
-                .iter()
-                .filter(|m| m.is_anon_rw() && !m.has_exec() && !m.is_special())
-                .map(|m| m.size())
-                .sum::<u64>()
-                / 1024
-                / 1024;
 
             debug!(
                 pid = candidate.pid,
                 name = %candidate.name,
                 anon_rss_mb = candidate.anon_rss_mb,
                 anon_rw_regions = anon_rw_count,
-                eligible_mb = total_anon_rw_mb,
+                eligible_mb = total_anon_rw_bytes / 1024 / 1024,
                 "Level 3 candidate — seeding KSM eligibility"
             );
 
@@ -412,5 +428,212 @@ mod tests {
         assert_eq!(scanner.config.interval_secs, 120);
         assert_eq!(scanner.config.min_anon_rss_mb, 200);
         assert_eq!(scanner.config.max_candidates_per_cycle, 10);
+    }
+
+    #[test]
+    fn test_l1_candidate_filters_kernel_small_and_blocklisted_processes() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 100,
+            blocklist: vec!["zramdedup".into()],
+            ..ScannerConfig::default()
+        };
+
+        assert!(l1_candidate_from_status(
+            ProcessStatus {
+                pid: 2,
+                name: "kthreadd".into(),
+                vm_anon_kb: 1024 * 1024,
+                ..Default::default()
+            },
+            &config
+        )
+        .is_none());
+
+        assert!(l1_candidate_from_status(
+            ProcessStatus {
+                pid: 100,
+                name: "tiny".into(),
+                vm_anon_kb: 99 * 1024,
+                ..Default::default()
+            },
+            &config
+        )
+        .is_none());
+
+        assert!(l1_candidate_from_status(
+            ProcessStatus {
+                pid: 101,
+                name: "zramdedup-daemon".into(),
+                vm_anon_kb: 500 * 1024,
+                ..Default::default()
+            },
+            &config
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_l1_candidate_keeps_large_unblocked_process() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 100,
+            blocklist: vec!["blocked".into()],
+            ..ScannerConfig::default()
+        };
+
+        let candidate = l1_candidate_from_status(
+            ProcessStatus {
+                pid: 200,
+                name: "browser".into(),
+                vm_anon_kb: 256 * 1024,
+                ..Default::default()
+            },
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(candidate.pid, 200);
+        assert_eq!(candidate.name, "browser");
+        assert_eq!(candidate.anon_rss_mb, 256);
+    }
+
+    #[test]
+    fn test_l2_filter_skips_already_mergeable_processes() {
+        assert!(passes_l2_already_merged_filter(None));
+        assert!(passes_l2_already_merged_filter(Some(&KsmProcStat {
+            merge_any: false,
+            ..Default::default()
+        })));
+        assert!(!passes_l2_already_merged_filter(Some(&KsmProcStat {
+            merge_any: true,
+            ..Default::default()
+        })));
+    }
+
+    #[test]
+    fn test_l25_filter_skips_negative_profit_only_when_known() {
+        assert!(passes_l25_profit_filter(None));
+        assert!(passes_l25_profit_filter(Some(&KsmProcStat {
+            process_profit: 0,
+            ..Default::default()
+        })));
+        assert!(passes_l25_profit_filter(Some(&KsmProcStat {
+            process_profit: 42,
+            ..Default::default()
+        })));
+        assert!(!passes_l25_profit_filter(Some(&KsmProcStat {
+            process_profit: -1,
+            ..Default::default()
+        })));
+    }
+
+    fn map(start: u64, end: u64, perms: &str, inode: u64, pathname: &str) -> MapsEntry {
+        MapsEntry {
+            start,
+            end,
+            perms: perms.into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode,
+            pathname: pathname.into(),
+        }
+    }
+
+    #[test]
+    fn test_eligible_anon_rw_summary_counts_only_l3_candidates() {
+        let maps = vec![
+            map(0x1000, 0x5000, "rw-p", 0, ""),
+            map(0x5000, 0x9000, "rwxp", 0, ""),
+            map(0x9000, 0xD000, "rw-s", 0, ""),
+            map(0xD000, 0x11000, "rw-p", 12, "/tmp/file"),
+            map(0x11000, 0x15000, "rw-p", 0, "[heap]"),
+            map(0x15000, 0x1D000, "rw-p", 0, ""),
+        ];
+
+        let (count, bytes) = eligible_anon_rw_summary(&maps);
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 0x4000 + 0x8000);
+    }
+
+    #[test]
+    fn test_pipeline_helpers_model_l1_l2_l25_l3_flow() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 128,
+            max_candidates_per_cycle: 1,
+            blocklist: vec!["blocked".into()],
+            ..ScannerConfig::default()
+        };
+
+        let statuses = vec![
+            ProcessStatus {
+                pid: 10,
+                name: "small".into(),
+                vm_anon_kb: 64 * 1024,
+                ..Default::default()
+            },
+            ProcessStatus {
+                pid: 11,
+                name: "merged".into(),
+                vm_anon_kb: 256 * 1024,
+                ..Default::default()
+            },
+            ProcessStatus {
+                pid: 12,
+                name: "negative".into(),
+                vm_anon_kb: 512 * 1024,
+                ..Default::default()
+            },
+            ProcessStatus {
+                pid: 13,
+                name: "winner".into(),
+                vm_anon_kb: 1024 * 1024,
+                ..Default::default()
+            },
+        ];
+
+        let l1: Vec<Candidate> = statuses
+            .into_iter()
+            .filter_map(|status| l1_candidate_from_status(status, &config))
+            .collect();
+        assert_eq!(
+            l1.iter().map(|c| c.pid).collect::<Vec<_>>(),
+            vec![11, 12, 13]
+        );
+
+        let l2: Vec<Candidate> = l1
+            .into_iter()
+            .filter(|candidate| {
+                let stat = match candidate.pid {
+                    11 => Some(KsmProcStat {
+                        merge_any: true,
+                        ..Default::default()
+                    }),
+                    _ => None,
+                };
+                passes_l2_already_merged_filter(stat.as_ref())
+            })
+            .collect();
+        assert_eq!(l2.iter().map(|c| c.pid).collect::<Vec<_>>(), vec![12, 13]);
+
+        let mut l25: Vec<Candidate> = l2
+            .into_iter()
+            .filter(|candidate| {
+                let stat = match candidate.pid {
+                    12 => Some(KsmProcStat {
+                        process_profit: -100,
+                        ..Default::default()
+                    }),
+                    _ => None,
+                };
+                passes_l25_profit_filter(stat.as_ref())
+            })
+            .collect();
+        l25.sort_by(|a, b| b.anon_rss_mb.cmp(&a.anon_rss_mb));
+        l25.truncate(config.max_candidates_per_cycle);
+
+        assert_eq!(l25.len(), 1);
+        assert_eq!(l25[0].pid, 13);
+
+        let maps = vec![map(0x1000, 0x5000, "rw-p", 0, "")];
+        assert_eq!(eligible_anon_rw_summary(&maps), (1, 0x4000));
     }
 }
