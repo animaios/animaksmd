@@ -164,11 +164,7 @@ impl PsiTrigger {
     /// trigger string, and returns a ready-to-epoll trigger.
     ///
     /// Window range: 500_000 to 10_000_000 (500ms to 10s).
-    pub fn new(
-        kind: PsiTriggerKind,
-        threshold_us: u64,
-        window_us: u64,
-    ) -> Result<Self> {
+    pub fn new(kind: PsiTriggerKind, threshold_us: u64, window_us: u64) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
 
         // Open our own fd to /proc/pressure/memory with O_RDWR
@@ -294,6 +290,137 @@ mod tests {
         };
         let level = stats.classify(5.0, 2.0);
         assert!(level >= PressureLevel::High);
+    }
+
+    #[test]
+    fn test_display_idle() {
+        assert_eq!(PressureLevel::Idle.to_string(), "idle");
+        assert_eq!(PressureLevel::Low.to_string(), "low");
+        assert_eq!(PressureLevel::Medium.to_string(), "medium");
+        assert_eq!(PressureLevel::High.to_string(), "high");
+        assert_eq!(PressureLevel::Critical.to_string(), "critical");
+    }
+
+    #[test]
+    fn test_parse_empty_content() {
+        let stats = PsiStats::parse("").unwrap();
+        assert!((stats.some.avg10 - 0.0).abs() < 0.001);
+        assert!((stats.full.avg10 - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_blank_lines() {
+        let content = "\n\nsome avg10=0.50 avg60=0.25 avg300=0.10 total=1000\n\nfull avg10=0.10 avg60=0.05 avg300=0.02 total=500\n\n";
+        let stats = PsiStats::parse(content).unwrap();
+        assert!((stats.some.avg10 - 0.50).abs() < 0.001);
+        assert!((stats.full.avg10 - 0.10).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_malformed_token_skipped() {
+        // token without '=' should be skipped without error
+        let content = "some garbage avg10=1.0 avg60=0.5 avg300=0.1 total=100";
+        let stats = PsiStats::parse(content).unwrap();
+        assert!((stats.some.avg10 - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_parse_unknown_key_skipped() {
+        // unknown key=value pairs should be silently skipped
+        let content = "some avg10=1.0 avg60=0.5 avg300=0.1 unknown=42 total=100";
+        let stats = PsiStats::parse(content).unwrap();
+        assert!((stats.some.avg10 - 1.0).abs() < 0.001);
+        assert_eq!(stats.some.total, 100);
+    }
+
+    #[test]
+    fn test_classify_low() {
+        // score = 0.7*0.0 + 0.3*2.0 = 0.6 → Low
+        let stats_low = PsiStats {
+            some: PsiLine {
+                avg10: 2.0,
+                avg60: 1.0,
+                avg300: 0.5,
+                total: 100,
+            },
+            full: PsiLine {
+                avg10: 0.0,
+                avg60: 0.0,
+                avg300: 0.0,
+                total: 0,
+            },
+        };
+        // score = 0.7*0.0 + 0.3*2.0 = 0.6 → Low
+        assert_eq!(stats_low.classify(5.0, 2.0), PressureLevel::Low);
+    }
+
+    #[test]
+    fn test_classify_medium() {
+        // score >= 5.0 || some.avg10 >= some_threshold (5.0)
+        let stats = PsiStats {
+            some: PsiLine {
+                avg10: 5.0,
+                avg60: 2.0,
+                avg300: 0.5,
+                total: 100,
+            },
+            full: PsiLine {
+                avg10: 0.0,
+                avg60: 0.0,
+                avg300: 0.0,
+                total: 0,
+            },
+        };
+        assert_eq!(stats.classify(5.0, 2.0), PressureLevel::Medium);
+    }
+
+    #[test]
+    fn test_classify_critical() {
+        let stats = PsiStats {
+            some: PsiLine {
+                avg10: 30.0,
+                avg60: 20.0,
+                avg300: 10.0,
+                total: 500,
+            },
+            full: PsiLine {
+                avg10: 25.0,
+                avg60: 15.0,
+                avg300: 8.0,
+                total: 300,
+            },
+        };
+        // score = 0.7*25 + 0.3*30 = 17.5 + 9 = 26.5 >= 20 → Critical
+        assert_eq!(stats.classify(5.0, 2.0), PressureLevel::Critical);
+    }
+
+    #[test]
+    fn test_classify_high_via_full_threshold() {
+        // full.avg10 >= full_threshold * 2.0 (4.0) → High even if score is low
+        let stats = PsiStats {
+            some: PsiLine {
+                avg10: 0.5,
+                avg60: 0.3,
+                avg300: 0.1,
+                total: 10,
+            },
+            full: PsiLine {
+                avg10: 4.0,
+                avg60: 2.0,
+                avg300: 1.0,
+                total: 5,
+            },
+        };
+        assert_eq!(stats.classify(5.0, 2.0), PressureLevel::High);
+    }
+
+    #[test]
+    fn test_psi_stats_default_zeroes() {
+        let stats = PsiStats::default();
+        assert!((stats.some.avg10 - 0.0).abs() < 0.001);
+        assert_eq!(stats.some.total, 0);
+        assert!((stats.full.avg10 - 0.0).abs() < 0.001);
+        assert_eq!(stats.full.total, 0);
     }
 
     #[test]

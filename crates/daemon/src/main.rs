@@ -67,15 +67,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn run_daemon(config_path: PathBuf, dry_run: bool) -> anyhow::Result<()> {
     // Load configuration
-    let config = if config_path.exists() {
-        ZramdedupConfig::load(&config_path)?
-    } else {
-        info!(
-            path = %config_path.display(),
-            "Config file not found, using defaults"
-        );
-        ZramdedupConfig::default()
-    };
+    let config = load_config_or_default(&config_path)?;
 
     // Initialize tracing
     init_tracing(&config.general.log_level);
@@ -209,11 +201,7 @@ async fn run_daemon(config_path: PathBuf, dry_run: bool) -> anyhow::Result<()> {
 }
 
 async fn show_status(config_path: PathBuf) -> anyhow::Result<()> {
-    let config = if config_path.exists() {
-        ZramdedupConfig::load(&config_path)?
-    } else {
-        ZramdedupConfig::default()
-    };
+    let config = load_config_or_default(&config_path)?;
 
     init_tracing("info");
 
@@ -254,11 +242,7 @@ async fn show_status(config_path: PathBuf) -> anyhow::Result<()> {
 }
 
 async fn restore_ksm(config_path: PathBuf) -> anyhow::Result<()> {
-    let config = if config_path.exists() {
-        ZramdedupConfig::load(&config_path)?
-    } else {
-        ZramdedupConfig::default()
-    };
+    let config = load_config_or_default(&config_path)?;
 
     init_tracing("info");
 
@@ -271,8 +255,7 @@ async fn restore_ksm(config_path: PathBuf) -> anyhow::Result<()> {
 }
 
 fn init_tracing(log_level: &str) {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(log_level));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
 
     // Try journald first, fall back to stderr
     match tracing_journald::layer() {
@@ -290,5 +273,31 @@ fn init_tracing(log_level: &str) {
                 .with_writer(std::io::stderr)
                 .init();
         }
+    }
+}
+
+/// Load config from path or return defaults (with info log if file missing).
+fn load_config_or_default(config_path: &PathBuf) -> anyhow::Result<ZramdedupConfig> {
+    if config_path.exists() {
+        Ok(ZramdedupConfig::load(config_path)?)
+    } else {
+        info!(
+            path = %config_path.display(),
+            "Config file not found, using defaults"
+        );
+        Ok(ZramdedupConfig::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_config_or_default_nonexistent_returns_default() {
+        let path = PathBuf::from("/nonexistent/path/zramdedup.toml");
+        let config = load_config_or_default(&path).unwrap();
+        assert_eq!(config.governor.stabilization_secs, 30);
+        assert_eq!(config.general.log_level, "info");
     }
 }

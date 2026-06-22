@@ -121,16 +121,10 @@ impl KsmController {
             max_page_sharing: self.read_u64("max_page_sharing")?,
             smart_scan: self.read_u64("smart_scan").unwrap_or(1),
             advisor_mode: self.read_string("advisor_mode").unwrap_or_default(),
-            advisor_target_scan_time: self
-                .read_u64("advisor_target_scan_time")
-                .unwrap_or(200),
+            advisor_target_scan_time: self.read_u64("advisor_target_scan_time").unwrap_or(200),
             advisor_max_cpu: self.read_u64("advisor_max_cpu").unwrap_or(70),
-            advisor_min_pages_to_scan: self
-                .read_u64("advisor_min_pages_to_scan")
-                .unwrap_or(500),
-            advisor_max_pages_to_scan: self
-                .read_u64("advisor_max_pages_to_scan")
-                .unwrap_or(30000),
+            advisor_min_pages_to_scan: self.read_u64("advisor_min_pages_to_scan").unwrap_or(500),
+            advisor_max_pages_to_scan: self.read_u64("advisor_max_pages_to_scan").unwrap_or(30000),
         })
     }
 
@@ -305,14 +299,16 @@ impl KsmController {
 
     fn read_u64(&self, param: &str) -> Result<u64> {
         let path = self.base_path.join(param);
-        let content = fs::read_to_string(&path).map_err(|e| ZramdedupError::Sysfs {
-            path,
-            source: e,
-        })?;
+        let content =
+            fs::read_to_string(&path).map_err(|e| ZramdedupError::Sysfs { path, source: e })?;
         // Handle advisor_mode style values like "[none] scan-time"
         let trimmed = content.trim();
         // Strip brackets if present (for enum-style values)
-        let cleaned = trimmed.trim_start_matches('[').split(']').next().unwrap_or(trimmed);
+        let cleaned = trimmed
+            .trim_start_matches('[')
+            .split(']')
+            .next()
+            .unwrap_or(trimmed);
         cleaned.parse::<u64>().map_err(|_| ZramdedupError::Sysfs {
             path: self.base_path.join(param),
             source: std::io::Error::new(
@@ -324,10 +320,8 @@ impl KsmController {
 
     fn read_i64(&self, param: &str) -> Result<i64> {
         let path = self.base_path.join(param);
-        let content = fs::read_to_string(&path).map_err(|e| ZramdedupError::Sysfs {
-            path,
-            source: e,
-        })?;
+        let content =
+            fs::read_to_string(&path).map_err(|e| ZramdedupError::Sysfs { path, source: e })?;
         content
             .trim()
             .parse::<i64>()
@@ -342,10 +336,8 @@ impl KsmController {
 
     fn read_string(&self, param: &str) -> Result<String> {
         let path = self.base_path.join(param);
-        let content = fs::read_to_string(&path).map_err(|e| ZramdedupError::Sysfs {
-            path,
-            source: e,
-        })?;
+        let content =
+            fs::read_to_string(&path).map_err(|e| ZramdedupError::Sysfs { path, source: e })?;
         // Extract the active value from bracket notation like "[none] scan-time"
         let trimmed = content.trim();
         if trimmed.starts_with('[') {
@@ -396,5 +388,353 @@ mod tests {
         assert_eq!(ctrl.clamp_value("pages_to_scan", 50000), 30000);
         assert_eq!(ctrl.clamp_value("sleep_millisecs", 3), 5);
         assert_eq!(ctrl.clamp_value("unknown_param", 42), 42);
+    }
+
+    // ── Helper: create a KsmController pointing at a temp dir with seed files ─
+
+    struct TempKsm {
+        dir: tempfile::TempDir,
+        ctrl: KsmController,
+    }
+
+    macro_rules! seeded {
+        ($(($name:expr, $content:expr)),+ $(,)?) => {
+            TempKsm::with_seeded(vec![$(($name, $content)),+])
+        };
+        () => {
+            TempKsm::with_seeded(vec![])
+        };
+    }
+
+    impl TempKsm {
+        /// Create a temp directory with the given (filename → content) seed
+        /// files and return a KsmController pointed at it.
+        fn with_seeded(seeded: Vec<(&str, &str)>) -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            for (name, content) in seeded {
+                let path = dir.path().join(name);
+                std::fs::write(&path, content).expect("seed write");
+            }
+            let ctrl = KsmController {
+                base_path: dir.path().to_path_buf(),
+                last_update: Instant::now() - std::time::Duration::from_secs(60),
+                dry_run: false,
+            };
+            Self { dir, ctrl }
+        }
+
+        fn read(&self, name: &str) -> String {
+            let path = self.dir.path().join(name);
+            std::fs::read_to_string(&path).unwrap_or_default()
+        }
+    }
+
+    // ── read_u64 / read_i64 / read_string ────────────────────────────────
+
+    #[test]
+    fn test_read_u64() {
+        let t = seeded![("pages_shared", "12345")];
+        assert_eq!(t.ctrl.read_u64("pages_shared").unwrap(), 12345);
+    }
+
+    #[test]
+    fn test_read_u64_bracket_format() {
+        let t = seeded![("run", "[1] 0")];
+        assert_eq!(t.ctrl.read_u64("run").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_read_u64_not_found() {
+        let t = seeded![];
+        assert!(t.ctrl.read_u64("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_read_i64() {
+        let t = seeded![("general_profit", "-42")];
+        assert_eq!(t.ctrl.read_i64("general_profit").unwrap(), -42);
+    }
+
+    #[test]
+    fn test_read_i64_invalid() {
+        let t = seeded![("general_profit", "not_a_number")];
+        assert!(t.ctrl.read_i64("general_profit").is_err());
+    }
+
+    #[test]
+    fn test_read_string() {
+        let t = seeded![("advisor_mode", "none")];
+        assert_eq!(t.ctrl.read_string("advisor_mode").unwrap(), "none");
+    }
+
+    #[test]
+    fn test_read_string_bracket_active() {
+        let t = seeded![("advisor_mode", "[scan-time] none")];
+        assert_eq!(t.ctrl.read_string("advisor_mode").unwrap(), "scan-time");
+    }
+
+    #[test]
+    fn test_read_string_trim_whitespace() {
+        let t = seeded![("advisor_mode", "  none  ")];
+        assert_eq!(t.ctrl.read_string("advisor_mode").unwrap(), "none");
+    }
+
+    // ── write_param ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_write_param_writes_value() {
+        let t = seeded![("run", "0")];
+        t.ctrl.write_param("run", "1").unwrap();
+        assert_eq!(t.read("run"), "1");
+    }
+
+    #[test]
+    fn test_write_param_dry_run_does_not_write() {
+        let t = seeded![("run", "0")];
+        let dry = KsmController {
+            base_path: t.dir.path().to_path_buf(),
+            last_update: Instant::now() - std::time::Duration::from_secs(60),
+            dry_run: true,
+        };
+        dry.write_param("run", "2").unwrap();
+        assert_eq!(t.read("run"), "0");
+    }
+
+    // ── write_validated ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_write_validated_clamps_value() {
+        let t = seeded![("run", "0")];
+        t.ctrl.write_validated("run", 5).unwrap();
+        assert_eq!(t.read("run"), "2");
+    }
+
+    #[test]
+    fn test_write_validated_in_range() {
+        let t = seeded![("sleep_millisecs", "100")];
+        t.ctrl.write_validated("sleep_millisecs", 50).unwrap();
+        assert_eq!(t.read("sleep_millisecs"), "50");
+    }
+
+    // ── read_stats ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_read_stats_all_fields() {
+        let t = seeded![
+            ("pages_shared", "100"),
+            ("pages_sharing", "200"),
+            ("pages_unshared", "50"),
+            ("pages_volatile", "10"),
+            ("pages_scanned", "9999"),
+            ("pages_skipped", "5"),
+            ("full_scans", "42"),
+            ("general_profit", "123456"),
+            ("ksm_zero_pages", "7"),
+            ("stable_node_chains", "3"),
+            ("stable_node_dups", "1"),
+        ];
+        let stats = t.ctrl.read_stats().unwrap();
+        assert_eq!(stats.pages_shared, 100);
+        assert_eq!(stats.pages_sharing, 200);
+        assert_eq!(stats.pages_unshared, 50);
+        assert_eq!(stats.pages_volatile, 10);
+        assert_eq!(stats.pages_scanned, 9999);
+        assert_eq!(stats.pages_skipped, 5);
+        assert_eq!(stats.full_scans, 42);
+        assert_eq!(stats.general_profit, 123456);
+        assert_eq!(stats.ksm_zero_pages, 7);
+        assert_eq!(stats.stable_node_chains, 3);
+        assert_eq!(stats.stable_node_dups, 1);
+    }
+
+    #[test]
+    fn test_read_stats_optional_fields_default_zero() {
+        let t = seeded![
+            ("pages_shared", "10"),
+            ("pages_sharing", "20"),
+            ("pages_unshared", "5"),
+            ("pages_volatile", "2"),
+            ("pages_scanned", "100"),
+            ("pages_skipped", "1"),
+            ("full_scans", "7"),
+            ("general_profit", "500"),
+        ];
+        let stats = t.ctrl.read_stats().unwrap();
+        assert_eq!(stats.ksm_zero_pages, 0);
+        assert_eq!(stats.stable_node_chains, 0);
+        assert_eq!(stats.stable_node_dups, 0);
+    }
+
+    // ── read_config ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_read_config_all_fields() {
+        let t = seeded![
+            ("run", "1"),
+            ("pages_to_scan", "500"),
+            ("sleep_millisecs", "20"),
+            ("max_page_sharing", "256"),
+            ("smart_scan", "1"),
+            ("advisor_mode", "scan-time"),
+            ("advisor_target_scan_time", "200"),
+            ("advisor_max_cpu", "70"),
+            ("advisor_min_pages_to_scan", "500"),
+            ("advisor_max_pages_to_scan", "30000"),
+        ];
+        let cfg = t.ctrl.read_config().unwrap();
+        assert_eq!(cfg.run, 1);
+        assert_eq!(cfg.pages_to_scan, 500);
+        assert_eq!(cfg.sleep_millisecs, 20);
+        assert_eq!(cfg.max_page_sharing, 256);
+        assert_eq!(cfg.smart_scan, 1);
+        assert_eq!(cfg.advisor_mode, "scan-time");
+        assert_eq!(cfg.advisor_target_scan_time, 200);
+        assert_eq!(cfg.advisor_max_cpu, 70);
+        assert_eq!(cfg.advisor_min_pages_to_scan, 500);
+        assert_eq!(cfg.advisor_max_pages_to_scan, 30000);
+    }
+
+    #[test]
+    fn test_read_config_missing_optionals_default() {
+        let t = seeded![
+            ("run", "0"),
+            ("pages_to_scan", "100"),
+            ("sleep_millisecs", "100"),
+            ("max_page_sharing", "256"),
+        ];
+        let cfg = t.ctrl.read_config().unwrap();
+        assert_eq!(cfg.smart_scan, 1);
+        assert_eq!(cfg.advisor_mode, "");
+        assert_eq!(cfg.advisor_target_scan_time, 200);
+        assert_eq!(cfg.advisor_max_cpu, 70);
+    }
+
+    // ── set_* convenience methods ───────────────────────────────────────
+
+    #[test]
+    fn test_set_run_writes_clamped() {
+        let t = seeded![("run", "0")];
+        t.ctrl.set_run(1).unwrap();
+        assert_eq!(t.read("run"), "1");
+    }
+
+    #[test]
+    fn test_set_pages_to_scan() {
+        let t = seeded![("pages_to_scan", "100")];
+        t.ctrl.set_pages_to_scan(1000).unwrap();
+        assert_eq!(t.read("pages_to_scan"), "1000");
+    }
+
+    #[test]
+    fn test_set_advisor_mode_writes_string() {
+        let t = seeded![("advisor_mode", "none")];
+        t.ctrl.set_advisor_mode("scan-time").unwrap();
+        assert_eq!(t.read("advisor_mode"), "scan-time");
+    }
+
+    // ── snapshot / restore ──────────────────────────────────────────────
+
+    #[test]
+    fn test_snapshot_and_restore_roundtrip() {
+        let t = seeded![
+            ("run", "1"),
+            ("pages_to_scan", "500"),
+            ("sleep_millisecs", "20"),
+            ("max_page_sharing", "256"),
+            ("smart_scan", "1"),
+            ("advisor_mode", "none"),
+            ("advisor_target_scan_time", "200"),
+            ("advisor_max_cpu", "70"),
+            ("advisor_min_pages_to_scan", "500"),
+            ("advisor_max_pages_to_scan", "30000"),
+        ];
+        let state_dir = t.dir.path().join("state");
+
+        t.ctrl.snapshot(&state_dir).unwrap();
+        let snap_path = state_dir.join("ksm-snapshot.json");
+        assert!(snap_path.exists());
+
+        std::fs::write(t.dir.path().join("run"), "0").unwrap();
+        std::fs::write(t.dir.path().join("pages_to_scan"), "100").unwrap();
+
+        let mut ctrl = KsmController {
+            base_path: t.dir.path().to_path_buf(),
+            last_update: Instant::now() - std::time::Duration::from_secs(60),
+            dry_run: false,
+        };
+        ctrl.restore(&state_dir).unwrap();
+
+        assert_eq!(ctrl.read_u64("run").unwrap(), 1);
+        assert_eq!(ctrl.read_u64("pages_to_scan").unwrap(), 500);
+    }
+
+    #[test]
+    fn test_restore_no_snapshot_skips_gracefully() {
+        let t = seeded![("run", "1")];
+        let state_dir = t.dir.path().join("nonexistent-state");
+        let mut ctrl = KsmController {
+            base_path: t.dir.path().to_path_buf(),
+            last_update: Instant::now() - std::time::Duration::from_secs(60),
+            dry_run: false,
+        };
+        ctrl.restore(&state_dir).unwrap();
+        assert_eq!(ctrl.read_u64("run").unwrap(), 1);
+    }
+
+    // ── read_all_raw ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_read_all_raw() {
+        let t = seeded![("run", "1"), ("pages_to_scan", "100")];
+        let map = t.ctrl.read_all_raw();
+        assert_eq!(map.get("run").map(|s| s.as_str()), Some("1"));
+        assert_eq!(map.get("pages_to_scan").map(|s| s.as_str()), Some("100"));
+    }
+
+    #[test]
+    fn test_read_all_raw_empty_dir() {
+        let t = seeded![];
+        let map = t.ctrl.read_all_raw();
+        assert!(map.is_empty());
+    }
+
+    // ── new() ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_new_returns_error_for_nonexistent_path() {
+        let result = KsmController::new("/nonexistent/ksm/path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_succeeds_for_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = KsmController::new(dir.path().to_str().unwrap());
+        assert!(result.is_ok());
+    }
+
+    // ── set_dry_run ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_set_dry_run_toggle() {
+        let mut ctrl = KsmController {
+            base_path: PathBuf::from("/tmp"),
+            last_update: Instant::now(),
+            dry_run: false,
+        };
+        assert!(!ctrl.dry_run);
+        ctrl.set_dry_run(true);
+        assert!(ctrl.dry_run);
+        ctrl.set_dry_run(false);
+        assert!(!ctrl.dry_run);
+    }
+
+    // ── chrono_now format ───────────────────────────────────────────────
+
+    #[test]
+    fn test_chrono_now_format() {
+        let result = chrono_now();
+        assert!(!result.is_empty());
+        assert!(result.chars().all(|c| c.is_ascii_digit()));
     }
 }

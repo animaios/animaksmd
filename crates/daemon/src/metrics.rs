@@ -70,3 +70,25 @@ fn read_self_rss_kb() -> u64 {
     }
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_self_rss_kb() {
+        let rss = read_self_rss_kb();
+        // The test process itself has some RSS; even a minimal binary
+        // should have at least a few pages.
+        assert!(rss > 0, "expected nonzero RSS for the test process");
+    }
+
+    #[test]
+    fn test_read_self_rss_kb_returns_u64() {
+        // This is a type/safety check — read_self_rss_kb must never panic
+        // on the current process.
+        let rss = read_self_rss_kb();
+        // Sanity: a Rust test binary won't use terabytes
+        assert!(rss < 1_000_000_000, "RSS unreasonably large: {rss}");
+    }
+}

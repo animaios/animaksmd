@@ -376,4 +376,270 @@ mod tests {
         assert_eq!(parse_kb_value("  12345 kB"), 12345);
         assert_eq!(parse_kb_value("0 kB"), 0);
     }
+
+    #[test]
+    fn test_parse_kb_value_invalid() {
+        // Invalid number → unwrap_or(0)
+        assert_eq!(parse_kb_value("not_a_number"), 0);
+        assert_eq!(parse_kb_value(""), 0);
+    }
+
+    // ── MapsEntry ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_maps_entry_size() {
+        let entry = MapsEntry {
+            start: 0x1000,
+            end: 0x5000,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert_eq!(entry.size(), 0x4000);
+    }
+
+    #[test]
+    fn test_maps_entry_page_count() {
+        let entry = MapsEntry {
+            start: 0x1000,
+            end: 0x5000,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert_eq!(entry.page_count(), 4);
+    }
+
+    #[test]
+    fn test_maps_entry_page_count_partial() {
+        // A 1-byte range still counts as 1 page (floor division)
+        let entry = MapsEntry {
+            start: 0x1000,
+            end: 0x1001,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert_eq!(entry.page_count(), 0); // 1/4096 = 0
+    }
+
+    #[test]
+    fn test_is_anon_rw_true() {
+        let entry = MapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert!(entry.is_anon_rw());
+    }
+
+    #[test]
+    fn test_is_anon_rw_false_shared() {
+        let entry = MapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "rws-".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert!(!entry.is_anon_rw());
+    }
+
+    #[test]
+    fn test_is_anon_rw_false_file_backed() {
+        let entry = MapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 12345,
+            pathname: "/usr/lib/libc.so".into(),
+        };
+        assert!(!entry.is_anon_rw());
+    }
+
+    #[test]
+    fn test_has_exec() {
+        let exec_entry = MapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "r-xp".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert!(exec_entry.has_exec());
+
+        let no_exec_entry = MapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert!(!no_exec_entry.has_exec());
+    }
+
+    #[test]
+    fn test_is_special() {
+        let vdso = MapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "r-xp".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: "[vdso]".into(),
+        };
+        assert!(vdso.is_special());
+
+        let heap = MapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: "[heap]".into(),
+        };
+        assert!(heap.is_special());
+
+        let normal = MapsEntry {
+            start: 0x1000,
+            end: 0x2000,
+            perms: "rw-p".into(),
+            offset: 0,
+            dev: "00:00".into(),
+            inode: 0,
+            pathname: String::new(),
+        };
+        assert!(!normal.is_special());
+    }
+
+    // ── parse_maps_line edge cases ──────────────────────────────────────
+
+    #[test]
+    fn test_parse_maps_line_too_few_parts() {
+        assert!(parse_maps_line("").is_none());
+        assert!(parse_maps_line("7f8c40000000-7f8c40021000 rw-p 00000000 00:00").is_none());
+    }
+
+    #[test]
+    fn test_parse_maps_line_bad_range() {
+        // range without '-' separator
+        assert!(parse_maps_line("invalid rw-p 00000000 00:00 0").is_none());
+    }
+
+    #[test]
+    fn test_parse_maps_line_file_backed_path() {
+        let line = "7f8c3fe00000-7f8c3fe01000 r--p 00000000 08:01 12345 /usr/lib/libc.so";
+        let entry = parse_maps_line(line).unwrap();
+        assert_eq!(entry.pathname, "/usr/lib/libc.so");
+        assert_eq!(entry.inode, 12345);
+    }
+
+    #[test]
+    fn test_parse_maps_line_path_with_spaces() {
+        let line = "7f8c3fe00000-7f8c3fe01000 rw-p 00000000 00:00 0 /path/with spaces (deleted)";
+        let entry = parse_maps_line(line).unwrap();
+        assert!(entry.pathname.contains("spaces"));
+        assert!(entry.pathname.contains("deleted"));
+    }
+
+    #[test]
+    fn test_parse_maps_line_non_zero_offset() {
+        let line = "7f8c40000000-7f8c40001000 rw-p 00001000 00:00 0";
+        let entry = parse_maps_line(line).unwrap();
+        assert_eq!(entry.offset, 0x1000);
+    }
+
+    #[test]
+    fn test_parse_maps_line_vvar() {
+        let line = "7fff3fe00000-7fff3fe01000 r--p 00000000 00:00 0 [vvar]";
+        let entry = parse_maps_line(line).unwrap();
+        assert!(entry.is_special());
+    }
+
+    // ── ProcessStatus / parse_kb_value ──────────────────────────────────
+
+    #[test]
+    fn test_parse_kb_value_large_number() {
+        assert_eq!(parse_kb_value("  1048576 kB"), 1048576);
+    }
+
+    // ── read_ksm_stat format ────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_ksm_stat_content() {
+        // parse the raw format that /proc/PID/ksm_stat produces
+        let content = "ksm_rmap_items 42\nksm_merging_pages 7\nksm_process_profit 12345\nksm_merge_any 1\nksm_mergeable yes\n";
+        let mut stat = KsmProcStat::default();
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "ksm_rmap_items" => stat.rmap_items = parts[1].parse().unwrap_or(0),
+                    "ksm_merging_pages" => stat.merging_pages = parts[1].parse().unwrap_or(0),
+                    "ksm_process_profit" => stat.process_profit = parts[1].parse().unwrap_or(0),
+                    "ksm_merge_any" => stat.merge_any = parts[1] == "1" || parts[1] == "yes",
+                    "ksm_mergeable" => stat.mergeable = parts[1] == "1" || parts[1] == "yes",
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(stat.rmap_items, 42);
+        assert_eq!(stat.merging_pages, 7);
+        assert_eq!(stat.process_profit, 12345);
+        assert!(stat.merge_any);
+        assert!(stat.mergeable);
+    }
+
+    #[test]
+    fn test_parse_ksm_stat_unknown_field_skipped() {
+        let content = "ksm_unknown_field 99\nksm_rmap_items 5\n";
+        let mut stat = KsmProcStat::default();
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                match parts[0] {
+                    "ksm_rmap_items" => stat.rmap_items = parts[1].parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(stat.rmap_items, 5);
+    }
+
+    // ── MergeCandidate ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_merge_candidate_construction() {
+        let mc = MergeCandidate {
+            pid: 100,
+            process_name: "test_proc".into(),
+            start: 0x10000,
+            end: 0x20000,
+            size_bytes: 0x10000,
+            anon_rss_kb: 64,
+        };
+        assert_eq!(mc.pid, 100);
+        assert_eq!(mc.size_bytes, 65536);
+        assert_eq!(mc.anon_rss_kb, 64);
+    }
 }
