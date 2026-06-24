@@ -9,7 +9,8 @@ mod madvise;
 mod metrics;
 mod scanner;
 
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use tokio::signal;
@@ -67,6 +68,17 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_daemon(config_path: PathBuf, dry_run: bool) -> anyhow::Result<()> {
+    run_daemon_with_shutdown(config_path, dry_run, wait_for_shutdown_signal()).await
+}
+
+async fn run_daemon_with_shutdown<S>(
+    config_path: PathBuf,
+    dry_run: bool,
+    shutdown_signal: S,
+) -> anyhow::Result<()>
+where
+    S: Future<Output = anyhow::Result<&'static str>>,
+{
     // Load configuration
     let config = load_config_or_default(&config_path)?;
 
@@ -157,17 +169,11 @@ async fn run_daemon(config_path: PathBuf, dry_run: bool) -> anyhow::Result<()> {
 
     info!("All tasks spawned, waiting for shutdown signal");
 
-    // Wait for SIGTERM or SIGINT
-    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
-    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())?;
-
-    tokio::select! {
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM");
-        }
-        _ = sigint.recv() => {
-            info!("Received SIGINT");
-        }
+    let signal_name = shutdown_signal.await?;
+    match signal_name {
+        "SIGTERM" => info!("Received SIGTERM"),
+        "SIGINT" => info!("Received SIGINT"),
+        other => info!(signal = other, "Received shutdown signal"),
     }
 
     // Signal all tasks to shut down
@@ -201,20 +207,38 @@ async fn run_daemon(config_path: PathBuf, dry_run: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())?;
+    let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => {
+            Ok("SIGTERM")
+        }
+        _ = sigint.recv() => {
+            Ok("SIGINT")
+        }
+    }
+}
+
 async fn show_status(config_path: PathBuf) -> anyhow::Result<()> {
-    let config = load_config_or_default(&config_path)?;
-
     init_tracing("info");
+    print!(
+        "{}",
+        build_status_output(&config_path, Path::new("/proc/pressure/memory"))?
+    );
 
+    Ok(())
+}
+
+fn build_status_output(config_path: &Path, psi_path: &Path) -> anyhow::Result<String> {
+    let config = load_config_or_default(config_path)?;
     let ksm = KsmController::new(&config.governor.ksm_path)?;
     let stats = ksm.read_stats()?;
     let cfg = ksm.read_config()?;
+    let psi = PsiStats::read_from(psi_path)?;
 
-    let psi = zramdedup_common::psi::PsiStats::read_memory()?;
-
-    print!("{}", format_status(&cfg, &stats, &psi));
-
-    Ok(())
+    Ok(format_status(&cfg, &stats, &psi))
 }
 
 fn format_status(cfg: &KsmConfig, stats: &KsmStats, psi: &PsiStats) -> String {
@@ -265,12 +289,16 @@ async fn restore_ksm(config_path: PathBuf) -> anyhow::Result<()> {
     let config = load_config_or_default(&config_path)?;
 
     init_tracing("info");
+    restore_ksm_from_config(&config)?;
+    info!("KSM state restored successfully");
 
+    Ok(())
+}
+
+fn restore_ksm_from_config(config: &ZramdedupConfig) -> anyhow::Result<()> {
     let mut ksm = KsmController::new(&config.governor.ksm_path)?;
     let state_dir = PathBuf::from(&config.general.state_dir);
     ksm.restore(&state_dir)?;
-    info!("KSM state restored successfully");
-
     Ok(())
 }
 
@@ -297,7 +325,7 @@ fn init_tracing(log_level: &str) {
 }
 
 /// Load config from path or return defaults (with info log if file missing).
-fn load_config_or_default(config_path: &PathBuf) -> anyhow::Result<ZramdedupConfig> {
+fn load_config_or_default(config_path: &Path) -> anyhow::Result<ZramdedupConfig> {
     if config_path.exists() {
         Ok(ZramdedupConfig::load(config_path)?)
     } else {
@@ -312,6 +340,72 @@ fn load_config_or_default(config_path: &PathBuf) -> anyhow::Result<ZramdedupConf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seed_ksm_dir(dir: &Path) {
+        for (name, value) in [
+            ("run", "1"),
+            ("pages_to_scan", "500"),
+            ("sleep_millisecs", "20"),
+            ("max_page_sharing", "256"),
+            ("smart_scan", "1"),
+            ("advisor_mode", "none"),
+            ("advisor_target_scan_time", "200"),
+            ("advisor_max_cpu", "70"),
+            ("advisor_min_pages_to_scan", "500"),
+            ("advisor_max_pages_to_scan", "30000"),
+            ("pages_shared", "10"),
+            ("pages_sharing", "512"),
+            ("pages_unshared", "3"),
+            ("pages_volatile", "0"),
+            ("pages_scanned", "1000"),
+            ("pages_skipped", "2"),
+            ("full_scans", "7"),
+            ("general_profit", "12345"),
+        ] {
+            std::fs::write(dir.join(name), value).unwrap();
+        }
+    }
+
+    fn write_config(path: &Path, ksm_path: &Path, state_dir: &Path) {
+        std::fs::write(
+            path,
+            format!(
+                "[general]\nstate_dir = \"{}\"\n\n[governor]\nksm_path = \"{}\"\n",
+                state_dir.display(),
+                ksm_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn write_daemon_config(path: &Path, ksm_path: &Path, state_dir: &Path) {
+        std::fs::write(
+            path,
+            format!(
+                "[general]\nstate_dir = \"{}\"\n\n\
+                 [governor]\nenabled = false\nksm_path = \"{}\"\n\n\
+                 [scanner]\nenabled = false\n",
+                state_dir.display(),
+                ksm_path.display()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Config with governor and scanner enabled (for coverage of task-spawning paths).
+    fn write_daemon_config_all_enabled(path: &Path, ksm_path: &Path, state_dir: &Path) {
+        std::fs::write(
+            path,
+            format!(
+                "[general]\nstate_dir = \"{}\"\n\n\
+                 [governor]\nenabled = true\nksm_path = \"{}\"\n\n\
+                 [scanner]\nenabled = true\ninterval_secs = 3600\nmin_anon_rss_mb = 999999\n",
+                state_dir.display(),
+                ksm_path.display()
+            ),
+        )
+        .unwrap();
+    }
 
     #[test]
     fn test_load_config_or_default_nonexistent_returns_default() {
@@ -377,7 +471,163 @@ mod tests {
     }
 
     #[test]
+    fn test_build_status_output_reads_configured_ksm_and_psi_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        let psi_path = dir.path().join("memory.pressure");
+        std::fs::write(
+            &psi_path,
+            "some avg10=1.25 avg60=2.50 avg300=3.00 total=10\n\
+             full avg10=0.50 avg60=0.75 avg300=1.00 total=5\n",
+        )
+        .unwrap();
+
+        let config_path = dir.path().join("zramdedup.toml");
+        write_config(&config_path, &ksm_dir, &state_dir);
+
+        let output = build_status_output(&config_path, &psi_path).unwrap();
+        assert!(output.contains("pages_to_scan:          500"));
+        assert!(output.contains("pages_sharing:          512"));
+        assert!(output.contains("some avg60:             2.50%"));
+        assert!(output.contains("full avg10:             0.50%"));
+    }
+
+    #[tokio::test]
+    async fn test_show_status_reads_configured_ksm_when_proc_psi_exists() {
+        if !Path::new("/proc/pressure/memory").exists() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        let config_path = dir.path().join("zramdedup.toml");
+        write_config(&config_path, &ksm_dir, &state_dir);
+
+        show_status(config_path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_restore_ksm_restores_snapshot_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        let ctrl = KsmController::new(ksm_dir.to_str().unwrap()).unwrap();
+        ctrl.snapshot(&state_dir).unwrap();
+        std::fs::write(ksm_dir.join("run"), "0").unwrap();
+        std::fs::write(ksm_dir.join("pages_to_scan"), "100").unwrap();
+
+        let config_path = dir.path().join("zramdedup.toml");
+        write_config(&config_path, &ksm_dir, &state_dir);
+
+        restore_ksm(config_path).await.unwrap();
+
+        assert_eq!(std::fs::read_to_string(ksm_dir.join("run")).unwrap(), "1");
+        assert_eq!(
+            std::fs::read_to_string(ksm_dir.join("pages_to_scan")).unwrap(),
+            "500"
+        );
+    }
+
+    #[test]
+    fn test_restore_ksm_from_config_errors_for_missing_ksm_path() {
+        let mut config = ZramdedupConfig::default();
+        config.governor.ksm_path = "/nonexistent/ksm/path".into();
+        let err = restore_ksm_from_config(&config).unwrap_err();
+        assert!(err.to_string().contains("KSM path not found"));
+    }
+
+    #[tokio::test]
+    async fn test_run_daemon_with_injected_shutdown_dry_run_skips_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        let config_path = dir.path().join("zramdedup.toml");
+        write_daemon_config(&config_path, &ksm_dir, &state_dir);
+
+        run_daemon_with_shutdown(config_path, true, async { Ok("test") })
+            .await
+            .unwrap();
+
+        assert!(!state_dir.join("ksm-snapshot.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_run_daemon_with_injected_shutdown_snapshots_and_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        let config_path = dir.path().join("zramdedup.toml");
+        write_daemon_config(&config_path, &ksm_dir, &state_dir);
+
+        run_daemon_with_shutdown(config_path, false, async { Ok("SIGTERM") })
+            .await
+            .unwrap();
+
+        assert!(state_dir.join("ksm-snapshot.json").exists());
+        assert_eq!(std::fs::read_to_string(ksm_dir.join("run")).unwrap(), "1");
+    }
+
+    #[tokio::test]
+    async fn test_run_daemon_with_governor_and_scanner_enabled_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        let config_path = dir.path().join("zramdedup.toml");
+        write_daemon_config_all_enabled(&config_path, &ksm_dir, &state_dir);
+
+        run_daemon_with_shutdown(config_path.clone(), true, async { Ok("SIGINT") })
+            .await
+            .unwrap();
+
+        // Dry-run: snapshot should NOT exist
+        assert!(!state_dir.join("ksm-snapshot.json").exists());
+    }
+
+    #[tokio::test]
+    async fn test_run_daemon_with_governor_and_scanner_enabled_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm_dir = dir.path().join("ksm");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir(&ksm_dir).unwrap();
+        seed_ksm_dir(&ksm_dir);
+
+        let config_path = dir.path().join("zramdedup.toml");
+        write_daemon_config_all_enabled(&config_path, &ksm_dir, &state_dir);
+
+        run_daemon_with_shutdown(config_path, false, async { Ok("SIGTERM") })
+            .await
+            .unwrap();
+
+        // Non-dry-run: snapshot + restore should have happened
+        assert!(state_dir.join("ksm-snapshot.json").exists());
+        assert_eq!(std::fs::read_to_string(ksm_dir.join("run")).unwrap(), "1");
+    }
+
+    #[test]
     fn test_init_tracing_is_idempotent() {
+        // init_tracing calls tracing_journald::layer() which fails in CI,
+        // so this hits the Err branch for the second call (already initialized).
+        // The first call may hit either branch depending on environment.
         init_tracing("debug");
         init_tracing("info");
     }
