@@ -500,6 +500,26 @@ mod tests {
         assert_eq!(t.read("run"), "0");
     }
 
+    #[test]
+    fn test_write_param_rate_limited_skips_write() {
+        let t = seeded![("run", "0")];
+        let rate_limited = KsmController {
+            base_path: t.dir.path().to_path_buf(),
+            last_update: Instant::now(),
+            dry_run: false,
+        };
+        rate_limited.write_param("run", "1").unwrap();
+        assert_eq!(t.read("run"), "0");
+    }
+
+    #[test]
+    fn test_write_param_directory_returns_error() {
+        let t = seeded![];
+        std::fs::create_dir(t.dir.path().join("directory")).unwrap();
+        let err = t.ctrl.write_param("directory", "1").unwrap_err();
+        assert!(err.to_string().contains("directory"));
+    }
+
     // ── write_validated ─────────────────────────────────────────────────
 
     #[test]
@@ -681,6 +701,36 @@ mod tests {
         assert_eq!(ctrl.read_u64("run").unwrap(), 1);
     }
 
+    #[test]
+    fn test_snapshot_errors_when_state_dir_is_file() {
+        let t = seeded![
+            ("run", "1"),
+            ("pages_to_scan", "500"),
+            ("sleep_millisecs", "20"),
+            ("max_page_sharing", "256"),
+        ];
+        let state_dir = t.dir.path().join("state-file");
+        std::fs::write(&state_dir, "not a directory").unwrap();
+
+        assert!(t.ctrl.snapshot(&state_dir).is_err());
+    }
+
+    #[test]
+    fn test_restore_invalid_snapshot_json_returns_error() {
+        let t = seeded![("run", "1")];
+        let state_dir = t.dir.path().join("state");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(state_dir.join("ksm-snapshot.json"), "not json").unwrap();
+
+        let mut ctrl = KsmController {
+            base_path: t.dir.path().to_path_buf(),
+            last_update: Instant::now() - std::time::Duration::from_secs(60),
+            dry_run: false,
+        };
+        let err = ctrl.restore(&state_dir).unwrap_err();
+        assert!(err.to_string().contains("snapshot"));
+    }
+
     // ── read_all_raw ────────────────────────────────────────────────────
 
     #[test]
@@ -696,6 +746,16 @@ mod tests {
         let t = seeded![];
         let map = t.ctrl.read_all_raw();
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_read_all_raw_skips_unreadable_directory_entries() {
+        let t = seeded![("run", "1")];
+        std::fs::create_dir(t.dir.path().join("nested")).unwrap();
+
+        let map = t.ctrl.read_all_raw();
+        assert_eq!(map.get("run").map(|s| s.as_str()), Some("1"));
+        assert!(!map.contains_key("nested"));
     }
 
     // ── new() ───────────────────────────────────────────────────────────

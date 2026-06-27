@@ -711,6 +711,16 @@ mod tests {
         assert_eq!(gov.current_level, 0);
     }
 
+    #[tokio::test]
+    async fn test_apply_profile_manual_mode_writes_pages_to_scan_path() {
+        let mut gov = make_temp_gov_with(|c| c.use_advisor = false);
+        let state = new_shared_state();
+
+        gov.apply_profile(2, &state).await;
+
+        assert_eq!(gov.current_level, 2);
+    }
+
     #[test]
     fn test_observe_psi_stability_counts_stable_and_resets_on_jump() {
         let mut gov = make_temp_gov_with(|_| {});
@@ -786,5 +796,21 @@ mod tests {
         let s = state.read().await;
         assert_eq!(s.ksm_level, 3);
         assert_eq!(s.general_profit, -50);
+    }
+
+    #[tokio::test]
+    async fn test_run_exits_on_shutdown_signal() {
+        let gov = make_temp_gov_with(|c| c.use_advisor = false);
+        let state = new_shared_state();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(gov.run(state, shutdown_rx));
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

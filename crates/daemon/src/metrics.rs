@@ -74,6 +74,22 @@ fn read_self_rss_kb() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zramdedup_common::new_shared_state;
+
+    fn seed_ksm_stats(dir: &std::path::Path) {
+        for (name, value) in [
+            ("pages_shared", "10"),
+            ("pages_sharing", "20"),
+            ("pages_unshared", "5"),
+            ("pages_volatile", "1"),
+            ("pages_scanned", "100"),
+            ("pages_skipped", "2"),
+            ("full_scans", "3"),
+            ("general_profit", "4096"),
+        ] {
+            std::fs::write(dir.join(name), value).unwrap();
+        }
+    }
 
     #[test]
     fn test_read_self_rss_kb() {
@@ -90,5 +106,31 @@ mod tests {
         let rss = read_self_rss_kb();
         // Sanity: a Rust test binary won't use terabytes
         assert!(rss < 1_000_000_000, "RSS unreasonably large: {rss}");
+    }
+
+    #[tokio::test]
+    async fn test_report_metrics_reads_ksm_and_shared_state() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_ksm_stats(dir.path());
+        let ksm = KsmController::new(dir.path().to_str().unwrap()).unwrap();
+        let state = new_shared_state();
+
+        {
+            let mut s = state.write().await;
+            s.ksm_level = 3;
+            s.pages_sharing = 20;
+            s.general_profit = 4096;
+        }
+
+        report_metrics(&ksm, &state).await;
+    }
+
+    #[tokio::test]
+    async fn test_report_metrics_returns_on_ksm_read_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let ksm = KsmController::new(dir.path().to_str().unwrap()).unwrap();
+        let state = new_shared_state();
+
+        report_metrics(&ksm, &state).await;
     }
 }

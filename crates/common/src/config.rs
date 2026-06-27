@@ -4,24 +4,13 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// Top-level configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ZramdedupConfig {
     pub general: GeneralConfig,
     pub governor: GovernorConfig,
     pub scanner: ScannerConfig,
     pub swap_proxy: SwapProxyConfig,
-}
-
-impl Default for ZramdedupConfig {
-    fn default() -> Self {
-        Self {
-            general: GeneralConfig::default(),
-            governor: GovernorConfig::default(),
-            scanner: ScannerConfig::default(),
-            swap_proxy: SwapProxyConfig::default(),
-        }
-    }
 }
 
 impl ZramdedupConfig {
@@ -223,5 +212,81 @@ enabled = false
         assert_eq!(cfg.general.log_level, "debug");
         assert_eq!(cfg.general.poll_interval_ms, 1000);
         assert!(!cfg.scanner.enabled);
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_governor_thresholds() {
+        let mut cfg = ZramdedupConfig::default();
+        cfg.governor.psi_some_threshold = -0.1;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("psi_some_threshold"));
+
+        cfg = ZramdedupConfig::default();
+        cfg.governor.psi_full_threshold = 101.0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("psi_full_threshold"));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_governor_ranges() {
+        let mut cfg = ZramdedupConfig::default();
+        cfg.governor.advisor_scan_time_range = (10, 10);
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("advisor_scan_time_range"));
+
+        cfg = ZramdedupConfig::default();
+        cfg.governor.max_page_sharing_range = (1024, 256);
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_page_sharing_range"));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_scanner_values() {
+        let mut cfg = ZramdedupConfig::default();
+        cfg.scanner.min_anon_rss_mb = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("min_anon_rss_mb"));
+
+        cfg = ZramdedupConfig::default();
+        cfg.scanner.duplicate_ratio_threshold = 0.0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate_ratio_threshold"));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_swap_proxy_values() {
+        let mut cfg = ZramdedupConfig::default();
+        cfg.swap_proxy.device_size_gb = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("device_size_gb"));
+
+        cfg = ZramdedupConfig::default();
+        cfg.swap_proxy.dedup_table_max_entries = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("dedup_table_max_entries"));
     }
 }

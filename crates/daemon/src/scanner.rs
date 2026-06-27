@@ -94,6 +94,104 @@ fn eligible_anon_rw_summary(maps: &[MapsEntry]) -> (usize, u64) {
     (count, bytes)
 }
 
+fn collect_scan_targets<StatusFn, KsmFn, MapsFn>(
+    config: &ScannerConfig,
+    pids: Vec<u32>,
+    stats: &mut ScannerStats,
+    mut read_status: StatusFn,
+    mut read_ksm_stat: KsmFn,
+    mut read_maps: MapsFn,
+) -> Vec<(u32, Vec<procfs::MapsEntry>)>
+where
+    StatusFn: FnMut(u32) -> Option<ProcessStatus>,
+    KsmFn: FnMut(u32) -> Option<KsmProcStat>,
+    MapsFn: FnMut(u32) -> Option<Vec<procfs::MapsEntry>>,
+{
+    let mut l1_candidates: Vec<Candidate> = Vec::new();
+
+    for pid in pids {
+        let status = match read_status(pid) {
+            Some(s) => s,
+            None => continue,
+        };
+
+        if let Some(candidate) = l1_candidate_from_status(status, config) {
+            l1_candidates.push(candidate);
+        }
+    }
+
+    stats.processes_filtered_l1 += l1_candidates.len() as u64;
+
+    if l1_candidates.is_empty() {
+        debug!("No processes passed Level 1 RSS filter");
+        return Vec::new();
+    }
+
+    let mut l25_candidates: Vec<Candidate> = Vec::new();
+    let mut l2_passed_count = 0u64;
+
+    for candidate in l1_candidates {
+        let ksm_stat = read_ksm_stat(candidate.pid);
+        if !passes_l2_already_merged_filter(ksm_stat.as_ref()) {
+            continue;
+        }
+        l2_passed_count += 1;
+
+        if !passes_l25_profit_filter(ksm_stat.as_ref()) {
+            stats.processes_filtered_l25_profit += 1;
+            debug!(
+                pid = candidate.pid,
+                profit = ksm_stat.map(|s| s.process_profit).unwrap_or_default(),
+                "Skipped: KSM reports negative process profit"
+            );
+            continue;
+        }
+        l25_candidates.push(candidate);
+    }
+
+    stats.processes_filtered_l2 += l2_passed_count;
+
+    if l25_candidates.is_empty() {
+        debug!("All candidates filtered by KSM status or negative profit");
+        return Vec::new();
+    }
+
+    l25_candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.anon_rss_mb));
+    l25_candidates.truncate(config.max_candidates_per_cycle);
+
+    let mut targets: Vec<(u32, Vec<procfs::MapsEntry>)> = Vec::new();
+
+    for candidate in &l25_candidates {
+        let maps = match read_maps(candidate.pid) {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let (anon_rw_count, total_anon_rw_bytes) = eligible_anon_rw_summary(&maps);
+
+        if anon_rw_count == 0 {
+            continue;
+        }
+
+        debug!(
+            pid = candidate.pid,
+            name = %candidate.name,
+            anon_rss_mb = candidate.anon_rss_mb,
+            anon_rw_regions = anon_rw_count,
+            eligible_mb = total_anon_rw_bytes / 1024 / 1024,
+            "Level 3 candidate — seeding KSM eligibility"
+        );
+
+        targets.push((candidate.pid, maps));
+    }
+
+    if targets.is_empty() {
+        debug!("No Level 3 targets after maps filtering");
+    }
+
+    targets
+}
+
 /// The process scanner.
 pub struct Scanner {
     config: ScannerConfig,
@@ -174,101 +272,16 @@ impl Scanner {
             }
         };
 
-        let mut l1_candidates: Vec<Candidate> = Vec::new();
-
-        for pid in pids {
-            let status = match procfs::read_process_status(pid) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            if let Some(candidate) = l1_candidate_from_status(status, &self.config) {
-                l1_candidates.push(candidate);
-            }
-        }
-
-        self.stats.processes_filtered_l1 += l1_candidates.len() as u64;
-
-        if l1_candidates.is_empty() {
-            debug!("No processes passed Level 1 RSS filter");
-            return;
-        }
-
-        // === Level 2: Skip already-merged processes ===
-        let mut l2_candidates: Vec<Candidate> = Vec::new();
-
-        for candidate in l1_candidates {
-            let ksm_stat = procfs::read_ksm_stat(candidate.pid).ok();
-            if !passes_l2_already_merged_filter(ksm_stat.as_ref()) {
-                continue; // Already KSM-enabled
-            }
-            l2_candidates.push(candidate);
-        }
-
-        self.stats.processes_filtered_l2 += l2_candidates.len() as u64;
-
-        if l2_candidates.is_empty() {
-            debug!("All Level 1 candidates already KSM-enabled");
-            return;
-        }
-
-        // === Level 2.5: Skip processes where KSM reports negative profit ===
-        // If the kernel already determined that scanning this process wastes
-        // more CPU than it saves in merged pages, don't add more madvise hints.
-        let mut l25_candidates: Vec<Candidate> = Vec::new();
-
-        for candidate in l2_candidates {
-            let ksm_stat = procfs::read_ksm_stat(candidate.pid).ok();
-            if !passes_l25_profit_filter(ksm_stat.as_ref()) {
-                self.stats.processes_filtered_l25_profit += 1;
-                debug!(
-                    pid = candidate.pid,
-                    profit = ksm_stat.map(|s| s.process_profit).unwrap_or_default(),
-                    "Skipped: KSM reports negative process profit"
-                );
-                continue;
-            }
-            l25_candidates.push(candidate);
-        }
-
-        if l25_candidates.is_empty() {
-            debug!("All candidates filtered by negative KSM profit");
-            return;
-        }
-
-        // Sort by RSS (largest first) and take top K
-        l25_candidates.sort_by(|a, b| b.anon_rss_mb.cmp(&a.anon_rss_mb));
-        l25_candidates.truncate(self.config.max_candidates_per_cycle);
-
-        // === Level 3: Maps parsing + madvise for top K only ===
-        let mut targets: Vec<(u32, Vec<procfs::MapsEntry>)> = Vec::new();
-
-        for candidate in &l25_candidates {
-            let maps = match procfs::read_process_maps(candidate.pid) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-
-            let (anon_rw_count, total_anon_rw_bytes) = eligible_anon_rw_summary(&maps);
-
-            if anon_rw_count == 0 {
-                continue;
-            }
-
-            debug!(
-                pid = candidate.pid,
-                name = %candidate.name,
-                anon_rss_mb = candidate.anon_rss_mb,
-                anon_rw_regions = anon_rw_count,
-                eligible_mb = total_anon_rw_bytes / 1024 / 1024,
-                "Level 3 candidate — seeding KSM eligibility"
-            );
-
-            targets.push((candidate.pid, maps));
-        }
+        let targets = collect_scan_targets(
+            &self.config,
+            pids,
+            &mut self.stats,
+            |pid| procfs::read_process_status(pid).ok(),
+            |pid| procfs::read_ksm_stat(pid).ok(),
+            |pid| procfs::read_process_maps(pid).ok(),
+        );
 
         if targets.is_empty() {
-            debug!("No Level 3 targets after maps filtering");
             return;
         }
 
@@ -277,7 +290,7 @@ impl Scanner {
         let results = madvise::batch_apply_mergeable(&targets, max_bytes, self.dry_run);
 
         // Aggregate statistics
-        for (_pid, result) in &results {
+        for result in results.values() {
             self.stats.processes_targeted += 1;
             self.stats.madvise_calls += result.regions_merged as u64;
             self.stats.total_bytes_marked += result.total_bytes_marked;
@@ -375,6 +388,46 @@ mod tests {
             scanner.stats.skipped_stabilization, 0,
             "a fresh governor action must not defer the scanner"
         );
+    }
+
+    #[tokio::test]
+    async fn scanner_defer_when_scanner_stabilization_window_is_active() {
+        let mut scanner = Scanner::new(ScannerConfig::default(), true, 30);
+        let state = Arc::new(RwLock::new(GovernorState::default()));
+
+        {
+            let mut s = state.write().await;
+            s.last_scanner_action = Instant::now();
+        }
+
+        scanner.scan_cycle(&state).await;
+
+        assert_eq!(scanner.stats.skipped_stabilization, 1);
+        assert_eq!(scanner.stats.processes_filtered_l1, 0);
+    }
+
+    #[tokio::test]
+    async fn scanner_run_exits_on_shutdown_signal() {
+        let scanner = Scanner::new(
+            ScannerConfig {
+                interval_secs: 60,
+                min_anon_rss_mb: u64::MAX,
+                ..ScannerConfig::default()
+            },
+            true,
+            0,
+        );
+        let state = Arc::new(RwLock::new(GovernorState::default()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(scanner.run(state, shutdown_rx));
+        shutdown_tx.send(true).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     // ── Unit tests: constructor and defaults ──────────────────────────
@@ -552,6 +605,158 @@ mod tests {
         let (count, bytes) = eligible_anon_rw_summary(&maps);
         assert_eq!(count, 2);
         assert_eq!(bytes, 0x4000 + 0x8000);
+    }
+
+    #[test]
+    fn test_collect_scan_targets_returns_empty_when_l1_has_no_candidates() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 128,
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+
+        let targets = collect_scan_targets(
+            &config,
+            vec![1, 2, 10],
+            &mut stats,
+            |pid| {
+                Some(ProcessStatus {
+                    pid,
+                    name: "tiny".into(),
+                    vm_anon_kb: 64 * 1024,
+                    ..Default::default()
+                })
+            },
+            |_| None,
+            |_| None,
+        );
+
+        assert!(targets.is_empty());
+        assert_eq!(stats.processes_filtered_l1, 0);
+        assert_eq!(stats.processes_filtered_l2, 0);
+    }
+
+    #[test]
+    fn test_collect_scan_targets_filters_already_merged_processes() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 128,
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+
+        let targets = collect_scan_targets(
+            &config,
+            vec![10, 11],
+            &mut stats,
+            |pid| {
+                Some(ProcessStatus {
+                    pid,
+                    name: format!("proc-{pid}"),
+                    vm_anon_kb: 256 * 1024,
+                    ..Default::default()
+                })
+            },
+            |_| {
+                Some(KsmProcStat {
+                    merge_any: true,
+                    ..Default::default()
+                })
+            },
+            |_| Some(vec![map(0x1000, 0x5000, "rw-p", 0, "")]),
+        );
+
+        assert!(targets.is_empty());
+        assert_eq!(stats.processes_filtered_l1, 2);
+        assert_eq!(stats.processes_filtered_l2, 0);
+    }
+
+    #[test]
+    fn test_collect_scan_targets_filters_negative_profit_and_missing_maps() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 128,
+            max_candidates_per_cycle: 3,
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+
+        let targets = collect_scan_targets(
+            &config,
+            vec![10, 11, 12],
+            &mut stats,
+            |pid| {
+                Some(ProcessStatus {
+                    pid,
+                    name: format!("proc-{pid}"),
+                    vm_anon_kb: 256 * 1024,
+                    ..Default::default()
+                })
+            },
+            |pid| match pid {
+                10 => Some(KsmProcStat {
+                    process_profit: -1,
+                    ..Default::default()
+                }),
+                _ => None,
+            },
+            |pid| match pid {
+                11 => None,
+                12 => Some(vec![map(0x1000, 0x5000, "rw-p", 0, "")]),
+                _ => unreachable!(),
+            },
+        );
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, 12);
+        assert_eq!(stats.processes_filtered_l1, 3);
+        assert_eq!(stats.processes_filtered_l2, 3);
+        assert_eq!(stats.processes_filtered_l25_profit, 1);
+    }
+
+    #[test]
+    fn test_collect_scan_targets_sorts_by_rss_and_truncates_top_candidates() {
+        let config = ScannerConfig {
+            min_anon_rss_mb: 1,
+            max_candidates_per_cycle: 2,
+            ..ScannerConfig::default()
+        };
+        let mut stats = ScannerStats::default();
+
+        let targets = collect_scan_targets(
+            &config,
+            vec![10, 11, 12],
+            &mut stats,
+            |pid| {
+                let anon_mb = match pid {
+                    10 => 64,
+                    11 => 512,
+                    12 => 256,
+                    _ => 0,
+                };
+                Some(ProcessStatus {
+                    pid,
+                    name: format!("proc-{pid}"),
+                    vm_anon_kb: anon_mb * 1024,
+                    ..Default::default()
+                })
+            },
+            |_| None,
+            |pid| {
+                Some(vec![map(
+                    pid as u64 * 0x10000,
+                    pid as u64 * 0x10000 + 0x4000,
+                    "rw-p",
+                    0,
+                    "",
+                )])
+            },
+        );
+
+        assert_eq!(
+            targets.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+        assert_eq!(stats.processes_filtered_l1, 3);
+        assert_eq!(stats.processes_filtered_l2, 3);
     }
 
     #[test]

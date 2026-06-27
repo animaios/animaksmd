@@ -162,10 +162,8 @@ impl DedupTable {
     /// and eviction failed.
     pub fn insert(&self, fp: Fingerprint, page_data: &[u8]) -> Option<u64> {
         // Check capacity
-        if self.map.len() as u64 >= self.max_entries {
-            if !self.evict_lru() {
-                return None;
-            }
+        if self.map.len() as u64 >= self.max_entries && !self.evict_lru() {
+            return None;
         }
 
         // Allocate a backend slot

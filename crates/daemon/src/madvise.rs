@@ -677,12 +677,54 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_mergeable_non_dry_run_reports_fallback_errors() {
+        let result = apply_mergeable(
+            std::process::id(),
+            &[MapsEntry {
+                start: 0x10000,
+                end: 0x11000,
+                perms: "rw-p".into(),
+                offset: 0,
+                dev: "00:00".into(),
+                inode: 0,
+                pathname: String::new(),
+            }],
+            4096,
+            false,
+        );
+
+        assert_eq!(result.regions_attempted, 1);
+        assert_eq!(result.regions_merged, 0);
+        assert_eq!(result.total_bytes_marked, 0);
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].1.contains("process_madvise failed"));
+    }
+
+    #[test]
     fn test_collapse_regions_returns_zero_without_large_eligible_regions() {
         let collapsed = collapse_regions(
             std::process::id(),
             &[MapsEntry {
                 start: 0x10000,
                 end: 0x11000,
+                perms: "rw-p".into(),
+                offset: 0,
+                dev: "00:00".into(),
+                inode: 0,
+                pathname: String::new(),
+            }],
+        );
+
+        assert_eq!(collapsed, 0);
+    }
+
+    #[test]
+    fn test_collapse_regions_attempts_large_aligned_region_without_panicking() {
+        let collapsed = collapse_regions(
+            std::process::id(),
+            &[MapsEntry {
+                start: 0x200000,
+                end: 0x400000,
                 perms: "rw-p".into(),
                 offset: 0,
                 dev: "00:00".into(),
@@ -837,5 +879,19 @@ mod tests {
     fn test_errno_to_str_known_and_unknown() {
         assert!(errno_to_str(libc::EPERM).contains("EPERM"));
         assert_eq!(errno_to_str(999_999), "unknown");
+    }
+
+    #[test]
+    fn test_process_madvise_helpers_report_bad_fd() {
+        let iov = libc::iovec {
+            iov_base: 0x10000usize as *mut libc::c_void,
+            iov_len: 4096,
+        };
+
+        let batch_err = process_madvise_batch(-1, &[iov], MADV_MERGEABLE).unwrap_err();
+        let single_err = process_madvise_single(-1, 0x10000, 4096, MADV_MERGEABLE).unwrap_err();
+
+        assert!(batch_err.contains("errno="));
+        assert!(single_err.contains("errno="));
     }
 }

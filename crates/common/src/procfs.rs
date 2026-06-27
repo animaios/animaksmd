@@ -273,7 +273,7 @@ fn read_pagemap_range_from(proc_path: &Path, pid: u32, start: u64, end: u64) -> 
     let page_start = start / 4096;
     let page_count = (end - start) / 4096;
 
-    if let Err(_) = file.seek(SeekFrom::Start(page_start * 8)) {
+    if file.seek(SeekFrom::Start(page_start * 8)).is_err() {
         return Ok(pfns); // Process may have exited
     }
 
@@ -576,6 +576,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_maps_line_bad_hex_bounds() {
+        assert!(parse_maps_line("zz-2000 rw-p 00000000 00:00 0").is_none());
+        assert!(parse_maps_line("1000-zz rw-p 00000000 00:00 0").is_none());
+    }
+
+    #[test]
     fn test_parse_maps_line_file_backed_path() {
         let line = "7f8c3fe00000-7f8c3fe01000 r--p 00000000 08:01 12345 /usr/lib/libc.so";
         let entry = parse_maps_line(line).unwrap();
@@ -694,6 +700,18 @@ mod tests {
     }
 
     #[test]
+    fn test_list_pids_reads_real_proc() {
+        let pids = list_pids().unwrap();
+        assert!(pids.contains(&std::process::id()));
+    }
+
+    #[test]
+    fn test_list_pids_from_missing_root_returns_error() {
+        let err = list_pids_from(Path::new("/nonexistent/proc/root")).unwrap_err();
+        assert!(err.to_string().contains("cannot read"));
+    }
+
+    #[test]
     fn test_read_process_status_from_temp_proc() {
         let dir = tempfile::tempdir().unwrap();
         let pid_dir = proc_pid(dir.path(), 123);
@@ -709,6 +727,22 @@ mod tests {
         assert_eq!(status.vm_rss_kb, 204800);
         assert_eq!(status.vm_anon_kb, 102400);
         assert_eq!(status.vm_swap_kb, 4096);
+    }
+
+    #[test]
+    fn test_read_process_status_reads_current_process() {
+        let status = read_process_status(std::process::id()).unwrap();
+        assert_eq!(status.pid, std::process::id());
+        assert!(!status.name.is_empty());
+    }
+
+    #[test]
+    fn test_read_process_status_from_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_pid(dir.path(), 123);
+
+        let err = read_process_status_from(dir.path(), 123).unwrap_err();
+        assert!(err.to_string().contains("cannot read"));
     }
 
     #[test]
@@ -728,6 +762,21 @@ mod tests {
         assert_eq!(maps[0].start, 0x1000);
         assert!(maps[0].is_anon_rw());
         assert_eq!(maps[1].pathname, "/tmp/file with spaces");
+    }
+
+    #[test]
+    fn test_read_process_maps_reads_current_process() {
+        let maps = read_process_maps(std::process::id()).unwrap();
+        assert!(!maps.is_empty());
+    }
+
+    #[test]
+    fn test_read_process_maps_from_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_pid(dir.path(), 123);
+
+        let err = read_process_maps_from(dir.path(), 123).unwrap_err();
+        assert!(err.to_string().contains("cannot read"));
     }
 
     #[test]
@@ -754,12 +803,28 @@ mod tests {
     }
 
     #[test]
+    fn test_read_ksm_stat_from_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_pid(dir.path(), 123);
+
+        let err = read_ksm_stat_from(dir.path(), 123).unwrap_err();
+        assert!(err.to_string().contains("cannot read"));
+    }
+
+    #[test]
     fn test_read_cgroup_procs_ignores_invalid_lines() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("cgroup.procs"), "10\nbad\n20\n\n").unwrap();
 
         let pids = read_cgroup_procs(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(pids, vec![10, 20]);
+    }
+
+    #[test]
+    fn test_read_cgroup_procs_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_cgroup_procs(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("cannot read"));
     }
 
     #[test]
@@ -781,6 +846,16 @@ mod tests {
     }
 
     #[test]
+    fn test_read_pagemap_pfn_from_short_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_dir = proc_pid(dir.path(), 123);
+        std::fs::write(pid_dir.join("pagemap"), [0u8; 4]).unwrap();
+
+        let err = read_pagemap_pfn_from(dir.path(), 123, 0).unwrap_err();
+        assert!(err.to_string().contains("cannot read pagemap entry"));
+    }
+
+    #[test]
     fn test_read_pagemap_range_from_temp_proc_filters_zero_and_absent() {
         let dir = tempfile::tempdir().unwrap();
         let pid_dir = proc_pid(dir.path(), 123);
@@ -796,11 +871,41 @@ mod tests {
     }
 
     #[test]
+    fn test_read_pagemap_pfn_reports_missing_real_process() {
+        let err = read_pagemap_pfn(u32::MAX, 0).unwrap_err();
+        assert!(err.to_string().contains("cannot open"));
+    }
+
+    #[test]
+    fn test_read_pagemap_range_reads_empty_range_for_current_process() {
+        let pfns = read_pagemap_range(std::process::id(), 0, 0).unwrap();
+        assert!(pfns.is_empty());
+    }
+
+    #[test]
+    fn test_read_pagemap_range_from_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_pid(dir.path(), 123);
+
+        let err = read_pagemap_range_from(dir.path(), 123, 0, 4096).unwrap_err();
+        assert!(err.to_string().contains("cannot open"));
+    }
+
+    #[test]
     fn test_read_process_comm_from_temp_proc_trims_newline() {
         let dir = tempfile::tempdir().unwrap();
         let pid_dir = proc_pid(dir.path(), 123);
         std::fs::write(pid_dir.join("comm"), "worker\n").unwrap();
 
         assert_eq!(read_process_comm_from(dir.path(), 123).unwrap(), "worker");
+    }
+
+    #[test]
+    fn test_read_process_comm_from_missing_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        proc_pid(dir.path(), 123);
+
+        let err = read_process_comm_from(dir.path(), 123).unwrap_err();
+        assert!(err.to_string().contains("cannot read"));
     }
 }

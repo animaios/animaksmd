@@ -261,41 +261,57 @@ impl ProxyEngine {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    run_command(cli.command)
+}
 
-    match cli.command {
+fn run_command(command: Commands) -> anyhow::Result<()> {
+    match command {
         Commands::Run {
             store_path,
             size_gb,
             max_entries,
             dry_run,
         } => run_proxy(store_path, size_gb, max_entries, dry_run),
-        Commands::Stats { store_path } => {
-            // Open store and show stats
-            println!("Note: Stats require the proxy to be running.");
-            println!("Store path: {}", store_path.display());
-            Ok(())
-        }
-        Commands::Cleanup => {
-            info!("Cleaning up after proxy crash");
-            // Ensure zram0 is still active as swap
-            let output = std::process::Command::new("swapon").arg("--show").output();
-            match output {
-                Ok(o) => {
-                    let stdout = String::from_utf8_lossy(&o.stdout);
-                    if stdout.contains("zram0") {
-                        println!("zram0 is still active as swap. No cleanup needed.");
-                    } else {
-                        println!("WARNING: zram0 is not active as swap!");
-                        println!("Run: swapon /dev/zram0");
-                    }
-                }
-                Err(e) => {
-                    println!("Could not check swap status: {e}");
-                }
+        Commands::Stats { store_path } => show_stats_command(&store_path),
+        Commands::Cleanup => cleanup_after_crash(),
+    }
+}
+
+fn show_stats_command(store_path: &Path) -> anyhow::Result<()> {
+    println!("Note: Stats require the proxy to be running.");
+    println!("Store path: {}", store_path.display());
+    Ok(())
+}
+
+fn cleanup_after_crash() -> anyhow::Result<()> {
+    info!("Cleaning up after proxy crash");
+    let output = std::process::Command::new("swapon").arg("--show").output();
+    match output {
+        Ok(o) => {
+            for line in cleanup_messages_from_swapon_stdout(&String::from_utf8_lossy(&o.stdout)) {
+                println!("{line}");
             }
-            Ok(())
+        }
+        Err(e) => {
+            println!("{}", cleanup_message_from_swapon_error(&e));
         }
     }
+    Ok(())
+}
+
+fn cleanup_messages_from_swapon_stdout(stdout: &str) -> Vec<&'static str> {
+    if stdout.contains("zram0") {
+        vec!["zram0 is still active as swap. No cleanup needed."]
+    } else {
+        vec![
+            "WARNING: zram0 is not active as swap!",
+            "Run: swapon /dev/zram0",
+        ]
+    }
+}
+
+fn cleanup_message_from_swapon_error(error: &std::io::Error) -> String {
+    format!("Could not check swap status: {error}")
 }
 
 fn run_proxy(
@@ -507,6 +523,46 @@ mod tests {
     }
 
     #[test]
+    fn test_run_command_stats_prints_store_path() {
+        run_command(Commands::Stats {
+            store_path: PathBuf::from("/tmp/store.dat"),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_cleanup_messages_detect_zram0_active() {
+        let messages = cleanup_messages_from_swapon_stdout(
+            "NAME TYPE SIZE USED PRIO\n/dev/zram0 partition 4G 0B 100\n",
+        );
+        assert_eq!(
+            messages,
+            vec!["zram0 is still active as swap. No cleanup needed."]
+        );
+    }
+
+    #[test]
+    fn test_cleanup_messages_warn_when_zram0_missing() {
+        let messages = cleanup_messages_from_swapon_stdout("NAME TYPE SIZE USED PRIO\n");
+        assert_eq!(
+            messages,
+            vec![
+                "WARNING: zram0 is not active as swap!",
+                "Run: swapon /dev/zram0"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cleanup_message_formats_swapon_error() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing swapon");
+        assert_eq!(
+            cleanup_message_from_swapon_error(&err),
+            "Could not check swap status: missing swapon"
+        );
+    }
+
+    #[test]
     fn test_handle_write_passthrough_writes_direct_slot_and_counts_unique() {
         let (_dir, path) = engine_path();
         let engine = ProxyEngine::new(&path, 1, 128).unwrap();
@@ -584,5 +640,11 @@ mod tests {
     fn test_run_proxy_dry_run_simulation_completes() {
         let (_dir, path) = engine_path();
         run_proxy(path, 1, 2048, true).unwrap();
+    }
+
+    #[test]
+    fn test_run_proxy_real_mode_demo_completes() {
+        let (_dir, path) = engine_path();
+        run_proxy(path, 1, 128, false).unwrap();
     }
 }

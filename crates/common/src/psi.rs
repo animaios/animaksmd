@@ -472,6 +472,16 @@ mod tests {
     }
 
     #[test]
+    fn test_read_memory_reads_real_proc_when_available() {
+        if !Path::new(PSI_MEMORY_PATH).exists() {
+            return;
+        }
+
+        let stats = PsiStats::read_memory().unwrap();
+        assert!(stats.some.total > 0 || stats.full.total > 0);
+    }
+
+    #[test]
     fn test_psi_trigger_new_from_path_writes_and_rearms() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("memory.pressure");
@@ -542,6 +552,24 @@ mod tests {
         }
 
         let err = PsiTrigger::write_trigger(fd, "some 1 500000").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("Bad file descriptor") || message.contains("os error"));
+    }
+
+    #[test]
+    fn test_rearm_reports_closed_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.pressure");
+        std::fs::write(&path, "").unwrap();
+
+        let trigger = std::mem::ManuallyDrop::new(
+            PsiTrigger::new_from_path(&path, PsiTriggerKind::Some, 1000, 500_000).unwrap(),
+        );
+        unsafe {
+            libc::close(trigger.as_raw_fd());
+        }
+
+        let err = trigger.rearm().unwrap_err();
         let message = err.to_string();
         assert!(message.contains("Bad file descriptor") || message.contains("os error"));
     }
