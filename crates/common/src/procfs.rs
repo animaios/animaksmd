@@ -13,7 +13,7 @@ pub struct ProcessStatus {
     pub pid: u32,
     pub name: String,
     pub vm_rss_kb: u64,
-    pub vm_anon_kb: u64,
+    pub anon_rss_kb: u64,
     pub vm_swap_kb: u64,
 }
 
@@ -107,7 +107,7 @@ fn list_pids_from(proc_path: &Path) -> Result<Vec<u32>> {
     Ok(pids)
 }
 
-/// Read process status (VmRSS, VmAnon, etc.) from /proc/PID/status.
+/// Read process status (VmRSS, RssAnon, etc.) from /proc/PID/status.
 pub fn read_process_status(pid: u32) -> Result<ProcessStatus> {
     read_process_status_from(Path::new("/proc"), pid)
 }
@@ -129,8 +129,8 @@ fn read_process_status_from(proc_path: &Path, pid: u32) -> Result<ProcessStatus>
             status.name = value.trim().to_string();
         } else if let Some(value) = line.strip_prefix("VmRSS:") {
             status.vm_rss_kb = parse_kb_value(value);
-        } else if let Some(value) = line.strip_prefix("VmAnon:") {
-            status.vm_anon_kb = parse_kb_value(value);
+        } else if let Some(value) = line.strip_prefix("RssAnon:") {
+            status.anon_rss_kb = parse_kb_value(value);
         } else if let Some(value) = line.strip_prefix("VmSwap:") {
             status.vm_swap_kb = parse_kb_value(value);
         }
@@ -717,7 +717,7 @@ mod tests {
         let pid_dir = proc_pid(dir.path(), 123);
         std::fs::write(
             pid_dir.join("status"),
-            "Name:\tfirefox\nVmRSS:\t  204800 kB\nVmAnon:\t  102400 kB\nVmSwap:\t  4096 kB\n",
+            "Name:\tfirefox\nVmRSS:\t  204800 kB\nRssAnon:\t  102400 kB\nVmSwap:\t  4096 kB\n",
         )
         .unwrap();
 
@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(status.pid, 123);
         assert_eq!(status.name, "firefox");
         assert_eq!(status.vm_rss_kb, 204800);
-        assert_eq!(status.vm_anon_kb, 102400);
+        assert_eq!(status.anon_rss_kb, 102400);
         assert_eq!(status.vm_swap_kb, 4096);
     }
 

@@ -1,9 +1,12 @@
-//! Tier 2: process_madvise(2) interface for applying KSM to target processes.
+//! Tier 2: MADV_MERGEABLE injection via ptrace + process_madvise for COLLAPSE.
 //!
-//! Uses pidfd_open + process_madvise to mark anonymous memory regions
-//! as MADV_MERGEABLE without ptrace or process suspension.
+//! Since Linux's process_madvise(2) only supports MADV_COLD, MADV_COLLAPSE,
+//! MADV_PAGEOUT, MADV_WILLNEED for cross-process (NOT MADV_MERGEABLE),
+//! we use ptrace(2) to inject madvise(MADV_MERGEABLE) into target processes.
 //!
-//! ## Batched iovec
+//! For MADV_COLLAPSE we can use process_madvise directly.
+//!
+//! ## Batched iovec (for COLLAPSE via process_madvise)
 //!
 //! process_madvise(2) accepts an iovec array — instead of one syscall per
 //! VMA, we collect all eligible regions and fire a single batched call.
@@ -15,11 +18,21 @@
 //! those pages lose their THP backing. MADV_COLLAPSE (Linux 6.1+)
 //! re-promotes aligned 2MB regions to transparent huge pages, recovering
 //! TLB efficiency.
+//!
+//! ## MADV_MERGEABLE via ptrace
+//!
+//! We attach to the target process with ptrace(PTRACE_ATTACH), inject a
+//! madvise(addr, len, MADV_MERGEABLE) syscall, then detach. This is
+//! slower than batched process_madvise but is the only way to mark
+//! another process's memory as KSM-mergeable.
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
 
 use animaksm_common::procfs::MapsEntry;
+use nix::sys::ptrace;
+use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::unistd::Pid;
 use tracing::{debug, info};
 
 /// MADV_MERGEABLE constant (from linux/mman.h).
@@ -33,6 +46,9 @@ const SYS_PROCESS_MADVISE: libc::c_long = 440;
 
 /// pidfd_open syscall number (x86_64).
 const SYS_PIDFD_OPEN: libc::c_long = 434;
+
+/// madvise syscall number (x86_64).
+const SYS_MADVISE: libc::c_long = 28;
 
 /// Maximum iovecs per process_madvise call (kernel limit is typically 1024).
 const MAX_IOV_BATCH: usize = 256;
@@ -49,9 +65,11 @@ pub struct MadviseResult {
 
 /// Apply MADV_MERGEABLE to anonymous RW regions of a target process.
 ///
-/// Uses process_madvise(2) via pidfd with **batched iovec** — all eligible
-/// regions are collected and sent in a single syscall, reducing overhead
-/// from N syscalls to 1.
+/// Uses ptrace(2) to inject madvise(MADV_MERGEABLE) syscalls into the
+/// target process, since process_madvise(2) does NOT support MADV_MERGEABLE
+/// for cross-process operations.
+///
+/// For dry_run, simulates the injection without actually attaching.
 pub fn apply_mergeable(
     pid: u32,
     regions: &[MapsEntry],
@@ -77,24 +95,12 @@ pub fn apply_mergeable(
         return result;
     }
 
-    // Open pidfd for the target process
-    let pidfd = match pidfd_open(pid) {
-        Ok(fd) => fd,
-        Err(e) => {
-            result.errors.push((0, format!("pidfd_open failed: {e}")));
-            return result;
-        }
-    };
-
-    // Collect regions into iovec batches (respecting max_bytes and MAX_IOV_BATCH)
+    // Collect regions into batches (respecting max_bytes and MAX_IOV_BATCH)
     let batch = build_batch(&eligible, max_bytes);
     result.regions_attempted = batch.len();
     let total_bytes: u64 = batch.iter().map(|&(_, len)| len as u64).sum();
 
     if batch.is_empty() {
-        unsafe {
-            libc::close(pidfd);
-        }
         return result;
     }
 
@@ -104,28 +110,40 @@ pub fn apply_mergeable(
                 pid,
                 start = format!("0x{addr:x}"),
                 size_kb = len / 1024,
-                "[DRY RUN] Would batch process_madvise(MADV_MERGEABLE)"
+                "[DRY RUN] Would inject MADV_MERGEABLE via ptrace"
             );
         }
         result.regions_merged = batch.len();
         result.total_bytes_marked = total_bytes;
-        unsafe {
-            libc::close(pidfd);
-        }
         return result;
     }
 
-    apply_madvise_batches(
-        pid,
-        &mut result,
-        &batch,
-        |iovs| process_madvise_batch(pidfd, iovs, MADV_MERGEABLE),
-        |addr, len| process_madvise_single(pidfd, addr, len, MADV_MERGEABLE),
-    );
+    // Inject MADV_MERGEABLE via ptrace for each region
+    // Find vdso syscall address once for this PID
+    let syscall_addr = match find_syscall_in_vdso(pid) {
+        Ok(addr) => addr,
+        Err(e) => {
+            for &(addr, _) in &batch {
+                result
+                    .errors
+                    .push((addr, format!("cannot find syscall instruction: {e}")));
+            }
+            return result;
+        }
+    };
 
-    // Close pidfd
-    unsafe {
-        libc::close(pidfd);
+    for &(addr, len) in &batch {
+        match madvise_via_ptrace(pid, addr, len, syscall_addr) {
+            Ok(_) => {
+                result.regions_merged += 1;
+                result.total_bytes_marked += len as u64;
+            }
+            Err(e) => {
+                result
+                    .errors
+                    .push((addr, format!("ptrace madvise failed: {e}")));
+            }
+        }
     }
 
     if result.regions_merged > 0 {
@@ -133,86 +151,11 @@ pub fn apply_mergeable(
             pid,
             regions_merged = result.regions_merged,
             total_kb = result.total_bytes_marked / 1024,
-            "Applied batched MADV_MERGEABLE to process regions"
+            "Applied MADV_MERGEABLE via ptrace to process regions"
         );
     }
 
     result
-}
-
-fn apply_madvise_batches<BatchFn, SingleFn>(
-    pid: u32,
-    result: &mut MadviseResult,
-    batch: &[(u64, usize)],
-    mut batch_call: BatchFn,
-    mut single_call: SingleFn,
-) where
-    BatchFn: FnMut(&[libc::iovec]) -> Result<u64, String>,
-    SingleFn: FnMut(u64, usize) -> Result<(), String>,
-{
-    for chunk in batch.chunks(MAX_IOV_BATCH) {
-        let iovs: Vec<libc::iovec> = chunk
-            .iter()
-            .map(|&(addr, len)| libc::iovec {
-                iov_base: addr as *mut libc::c_void,
-                iov_len: len,
-            })
-            .collect();
-
-        let total_chunk_bytes: u64 = chunk.iter().map(|&(_, len)| len as u64).sum();
-
-        match batch_call(&iovs) {
-            Ok(bytes_processed) => {
-                if bytes_processed == total_chunk_bytes {
-                    // All regions processed successfully
-                    result.regions_merged += chunk.len();
-                    result.total_bytes_marked += bytes_processed;
-                    debug!(
-                        pid,
-                        regions = chunk.len(),
-                        bytes = bytes_processed,
-                        "Batched process_madvise(MADV_MERGEABLE) succeeded"
-                    );
-                } else {
-                    // Partial success: kernel processed some but not all regions.
-                    // This is normal — some VMAs may have been unmapped, split, or
-                    // changed permissions between our maps read and the syscall.
-                    // We optimistically count all as merged since we can't determine
-                    // which specific iovec entries failed.
-                    result.regions_merged += chunk.len();
-                    result.total_bytes_marked += bytes_processed;
-                    debug!(
-                        pid,
-                        expected = total_chunk_bytes,
-                        processed = bytes_processed,
-                        "Partial batch madvise (some VMAs may have changed)"
-                    );
-                }
-            }
-            Err(e) => {
-                // Full batch failure — fall back to per-region calls
-                debug!(
-                    pid,
-                    error = %e,
-                    batch_size = chunk.len(),
-                    "Batched madvise failed, falling back to per-region"
-                );
-                for &(addr, len) in chunk {
-                    match single_call(addr, len) {
-                        Ok(_) => {
-                            result.regions_merged += 1;
-                            result.total_bytes_marked += len as u64;
-                        }
-                        Err(fallback_err) => {
-                            result
-                                .errors
-                                .push((addr, format!("process_madvise failed: {fallback_err}")));
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Opportunistically collapse memory regions into transparent huge pages.
@@ -329,15 +272,221 @@ fn pidfd_open(pid: u32) -> Result<RawFd, String> {
     Ok(ret as RawFd)
 }
 
-/// Batched process_madvise: send multiple iovecs in a single syscall.
+/// Find a `syscall` instruction (0x0F 0x05) in the target process’s vDSO.
 ///
-/// Returns the number of bytes successfully processed by the kernel.
-/// On full failure (ret < 0), returns an error string.
+/// We read /proc/pid/maps to locate the [vdso] mapping, then scan its
+/// memory via /proc/pid/mem for the two-byte sequence. Returns the
+/// virtual address of the instruction or an error string.
+fn find_syscall_in_vdso(pid: u32) -> Result<u64, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let maps = std::fs::read_to_string(format!("/proc/{}/maps", pid))
+        .map_err(|e| format!("read maps: {e}"))?;
+
+    let vdso_line = maps
+        .lines()
+        .find(|l| l.contains("[vdso]"))
+        .ok_or_else(|| "no [vdso] mapping found".to_string())?;
+
+    let vdso_start = vdso_line
+        .split('-')
+        .next()
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .ok_or_else(|| "bad vdso start".to_string())?;
+    let vdso_end = vdso_line
+        .split('-')
+        .nth(1)
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .ok_or_else(|| "bad vdso end".to_string())?;
+
+    // Read vDSO memory to find 0x0F 0x05 (syscall instruction)
+    // Validate vDSO size to prevent underflow/OOM
+    let sz = vdso_end
+        .checked_sub(vdso_start)
+        .ok_or_else(|| "vdso end before start".to_string())? as usize;
+    if sz > 10 * 1024 * 1024 {
+        return Err("vdso size too large".to_string());
+    }
+    let mut mem = std::fs::File::open(format!("/proc/{}/mem", pid))
+        .map_err(|e| format!("open /proc/{}/mem: {e}", pid))?;
+    mem.seek(SeekFrom::Start(vdso_start))
+        .map_err(|e| format!("seek: {e}"))?;
+    let mut buf = vec![0u8; sz];
+    mem.read_exact(&mut buf)
+        .map_err(|e| format!("read vdso: {e}"))?;
+
+    buf.windows(2)
+        .position(|w| w == [0x0f, 0x05])
+        .map(|off| vdso_start + off as u64)
+        .ok_or_else(|| "no syscall instruction in vdso".to_string())
+}
+
+/// Inject `madvise(MADV_MERGEABLE)` into a target process via ptrace.
+///
+/// ptrace(2) syscall injection pattern (x86_64):
+///   1. PTRACE_ATTACH + waitpid(WSTOPPED)
+///   2. getregs → save ALL registers (syscall clobbers rcx, r11)
+///   3. Find a `syscall` instruction in the target’s vDSO
+///   4. Set regs: rip → vDSO syscall addr, rax=28, rdi=addr, rsi=len, rdx=12
+///   5. ptrace(SYSCALL) → waitpid (entry stop)
+///   6. ptrace(SYSCALL) → waitpid (exit stop)
+///   7. getregs → read rax for return value
+///   8. Restore ALL original registers
+///   9. PTRACE_DETACH
+fn madvise_via_ptrace(pid: u32, addr: u64, len: usize, syscall_addr: u64) -> Result<(), String> {
+    let nix_pid = Pid::from_raw(pid as i32);
+
+    debug!(
+        pid,
+        addr = format!("0x{addr:x}"),
+        len_kb = len / 1024,
+        "Injecting madvise via ptrace"
+    );
+
+    // Attach to the target process
+    if let Err(e) = ptrace::attach(nix_pid) {
+        return Err(format!("ptrace attach failed: {e}"));
+    }
+
+    // Wait for the process to stop
+    match waitpid(nix_pid, Some(WaitPidFlag::WSTOPPED)) {
+        Ok(WaitStatus::Stopped(_, _)) => {}
+        Ok(WaitStatus::Exited(pid, code)) => {
+            return Err(format!("target process {pid} exited with code {code}"));
+        }
+        Ok(other) => {
+            return Err(format!("unexpected wait status: {other:?}"));
+        }
+        Err(e) => {
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("waitpid failed: {e}"));
+        }
+    }
+
+    // Get current registers and save ALL of them (syscall clobbers rcx, r11)
+    let orig = match ptrace::getregs(nix_pid) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("getregs failed: {e}"));
+        }
+    };
+
+    let mut regs = orig;
+
+    // Set up madvise(addr, len, MADV_MERGEABLE) syscall
+    // x86_64: rax=28 (SYS_madvise), rdi=addr, rsi=len, rdx=advice
+    regs.rip = syscall_addr;
+    regs.rax = SYS_MADVISE as u64;
+    regs.rdi = addr;
+    regs.rsi = len as u64;
+    regs.rdx = MADV_MERGEABLE as u64;
+
+    if let Err(e) = ptrace::setregs(nix_pid, regs) {
+        let _ = ptrace::detach(nix_pid, None);
+        return Err(format!("setregs failed: {e}"));
+    }
+
+    // Step 1: continue until syscall entry
+    if let Err(e) = ptrace::syscall(nix_pid, None) {
+        let _ = ptrace::setregs(nix_pid, orig);
+        let _ = ptrace::detach(nix_pid, None);
+        return Err(format!("ptrace syscall (entry) failed: {e}"));
+    }
+    match waitpid(nix_pid, Some(WaitPidFlag::WSTOPPED)) {
+        Ok(WaitStatus::Stopped(_, nix::sys::signal::Signal::SIGTRAP)) => {}
+        Ok(other) => {
+            let _ = ptrace::setregs(nix_pid, orig);
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("unexpected wait at syscall entry: {other:?}"));
+        }
+        Err(e) => {
+            let _ = ptrace::setregs(nix_pid, orig);
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("waitpid at syscall entry failed: {e}"));
+        }
+    }
+
+    // Step 2: continue until syscall exit
+    if let Err(e) = ptrace::syscall(nix_pid, None) {
+        let _ = ptrace::setregs(nix_pid, orig);
+        let _ = ptrace::detach(nix_pid, None);
+        return Err(format!("ptrace syscall (exit) failed: {e}"));
+    }
+    match waitpid(nix_pid, Some(WaitPidFlag::WSTOPPED)) {
+        Ok(WaitStatus::Stopped(_, nix::sys::signal::Signal::SIGTRAP)) => {}
+        Ok(other) => {
+            let _ = ptrace::setregs(nix_pid, orig);
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("unexpected wait at syscall exit: {other:?}"));
+        }
+        Err(e) => {
+            let _ = ptrace::setregs(nix_pid, orig);
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("waitpid at syscall exit failed: {e}"));
+        }
+    }
+
+    // Read the syscall return value from rax
+    let regs_after = match ptrace::getregs(nix_pid) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = ptrace::setregs(nix_pid, orig);
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("getregs after syscall failed: {e}"));
+        }
+    };
+
+    // Restore ALL original registers before detaching
+    if let Err(e) = ptrace::setregs(nix_pid, orig) {
+        // CRITICAL: if register restoration fails, the target will resume
+        // with corrupted registers (pointing to vDSO syscall) and crash.
+        // Treat as fatal, detach and return error.
+        let _ = ptrace::detach(nix_pid, None);
+        return Err(format!(
+            "failed to restore registers after ptrace injection: {e}"
+        ));
+    }
+
+    if let Err(e) = ptrace::detach(nix_pid, None) {
+        return Err(format!("ptrace detach failed: {e}"));
+    }
+
+    // Check result (rax contains return value; negative values are errno)
+    if (regs_after.rax as i64) < 0 && (regs_after.rax as i64) > -4096 {
+        let errno = (-(regs_after.rax as i64)) as i32;
+        return Err(format!(
+            "madvise failed: errno={errno} ({})",
+            errno_to_str(errno)
+        ));
+    }
+
+    Ok(())
+}
+
+/// Convert errno to human-readable string.
+fn errno_to_str(errno: i32) -> &'static str {
+    match errno {
+        libc::EPERM => "EPERM: Operation not permitted",
+        libc::ESRCH => "ESRCH: No such process",
+        libc::EINVAL => "EINVAL: Invalid argument",
+        libc::ENOMEM => "ENOMEM: Cannot allocate memory",
+        libc::EBADF => "EBADF: Bad file descriptor",
+        libc::ENOSYS => "ENOSYS: Function not implemented",
+        _ => "unknown",
+    }
+}
+
+#[allow(dead_code)]
 fn process_madvise_batch(
     pidfd: RawFd,
     iovs: &[libc::iovec],
     advice: libc::c_int,
 ) -> Result<u64, String> {
+    if advice == MADV_MERGEABLE {
+        return Err("MADV_MERGEABLE not supported by process_madvise; use ptrace".to_string());
+    }
     let ret = unsafe {
         libc::syscall(
             SYS_PROCESS_MADVISE,
@@ -345,30 +494,30 @@ fn process_madvise_batch(
             iovs.as_ptr(),
             iovs.len(),
             advice,
-            0u32, // flags
+            0u32,
         )
     };
-
     if ret < 0 {
         let errno = unsafe { *libc::__errno_location() };
         return Err(format!("errno={errno} ({})", errno_to_str(errno)));
     }
-
     Ok(ret as u64)
 }
 
-/// Single-region process_madvise call (used as fallback and for MADV_COLLAPSE).
+#[allow(dead_code)]
 fn process_madvise_single(
     pidfd: RawFd,
     addr: u64,
     len: usize,
     advice: libc::c_int,
 ) -> Result<(), String> {
+    if advice == MADV_MERGEABLE {
+        return Err("MADV_MERGEABLE not supported by process_madvise; use ptrace".to_string());
+    }
     let iov = libc::iovec {
         iov_base: addr as *mut libc::c_void,
         iov_len: len,
     };
-
     let ret = unsafe {
         libc::syscall(
             SYS_PROCESS_MADVISE,
@@ -379,24 +528,77 @@ fn process_madvise_single(
             0u32,
         )
     };
-
     if ret < 0 {
         let errno = unsafe { *libc::__errno_location() };
         return Err(format!("errno={errno} ({})", errno_to_str(errno)));
     }
-
     Ok(())
 }
 
-fn errno_to_str(errno: i32) -> &'static str {
-    match errno {
-        libc::EPERM => "EPERM: Operation not permitted",
-        libc::ESRCH => "ESRCH: No such process",
-        libc::EINVAL => "EINVAL: Invalid argument",
-        libc::ENOMEM => "ENOMEM: Cannot allocate memory",
-        libc::EBADF => "EBADF: Bad file descriptor",
-        libc::ENOSYS => "ENOSYS: Function not implemented",
-        _ => "unknown",
+#[allow(dead_code)]
+fn apply_madvise_batches<BatchFn, SingleFn>(
+    pid: u32,
+    result: &mut MadviseResult,
+    batch: &[(u64, usize)],
+    mut batch_call: BatchFn,
+    mut single_call: SingleFn,
+) where
+    BatchFn: FnMut(&[libc::iovec]) -> Result<u64, String>,
+    SingleFn: FnMut(u64, usize) -> Result<(), String>,
+{
+    for chunk in batch.chunks(MAX_IOV_BATCH) {
+        let iovs: Vec<libc::iovec> = chunk
+            .iter()
+            .map(|&(addr, len)| libc::iovec {
+                iov_base: addr as *mut libc::c_void,
+                iov_len: len,
+            })
+            .collect();
+        let total_chunk_bytes: u64 = chunk.iter().map(|&(_, len)| len as u64).sum();
+        match batch_call(&iovs) {
+            Ok(bytes_processed) => {
+                if bytes_processed == total_chunk_bytes {
+                    result.regions_merged += chunk.len();
+                    result.total_bytes_marked += bytes_processed;
+                    debug!(
+                        pid,
+                        regions = chunk.len(),
+                        bytes = bytes_processed,
+                        "Batched process_madvise(MADV_MERGEABLE) succeeded"
+                    );
+                } else {
+                    result.regions_merged += chunk.len();
+                    result.total_bytes_marked += bytes_processed;
+                    debug!(
+                        pid,
+                        expected = total_chunk_bytes,
+                        processed = bytes_processed,
+                        "Partial batch madvise (some VMAs may have changed)"
+                    );
+                }
+            }
+            Err(e) => {
+                debug!(
+                    pid,
+                    error = %e,
+                    batch_size = chunk.len(),
+                    "Batched madvise failed, falling back to per-region"
+                );
+                for &(addr, len) in chunk {
+                    match single_call(addr, len) {
+                        Ok(_) => {
+                            result.regions_merged += 1;
+                            result.total_bytes_marked += len as u64;
+                        }
+                        Err(fallback_err) => {
+                            result
+                                .errors
+                                .push((addr, format!("process_madvise failed: {fallback_err}")));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -641,16 +843,15 @@ mod tests {
             pathname: String::new(),
         }];
         let result = apply_mergeable(0xFFFFFF, &regions, 4096, true);
-        // pidfd_open should fail → error returned, nothing merged
-        assert!(result.regions_attempted == 0);
+        // In dry_run mode, we build a batch and simulate success without
+        // actually checking PID validity (ptrace happens at runtime, not batch-build time)
+        assert_eq!(result.regions_attempted, 1);
+        assert_eq!(result.regions_merged, 1);
+        assert_eq!(result.total_bytes_marked, 4096);
         assert!(
-            !result.errors.is_empty(),
-            "should report pidfd_open failure"
-        );
-        assert!(
-            result.errors[0].1.contains("pidfd_open failed"),
-            "error should mention pidfd_open: {}",
-            result.errors[0].1
+            result.errors.is_empty(),
+            "dry run should have no errors: {:?}",
+            result.errors
         );
     }
 
@@ -697,7 +898,8 @@ mod tests {
         assert_eq!(result.regions_merged, 0);
         assert_eq!(result.total_bytes_marked, 0);
         assert!(!result.errors.is_empty());
-        assert!(result.errors[0].1.contains("process_madvise failed"));
+        // Now uses ptrace injection, not process_madvise
+        assert!(result.errors[0].1.contains("ptrace madvise failed"));
     }
 
     #[test]
@@ -759,11 +961,9 @@ mod tests {
         assert_eq!(results.len(), 2, "should have entries for both PIDs");
         // First PID exists → dry-run succeeds with 1 region merged
         assert_eq!(results[&my_pid].regions_merged, 1);
-        // Second PID doesn't exist → pidfd_open fails, 0 merged
-        assert_eq!(results[&other_pid].regions_merged, 0);
-        assert!(results[&other_pid].errors[0]
-            .1
-            .contains("pidfd_open failed"));
+        // In dry_run mode, non-existent PID still simulates success
+        // (ptrace only runs at runtime, not during dry-run batch building)
+        assert_eq!(results[&other_pid].regions_merged, 1);
     }
 
     // ── MadviseResult ───────────────────────────────────────────────────
@@ -891,7 +1091,8 @@ mod tests {
         let batch_err = process_madvise_batch(-1, &[iov], MADV_MERGEABLE).unwrap_err();
         let single_err = process_madvise_single(-1, 0x10000, 4096, MADV_MERGEABLE).unwrap_err();
 
-        assert!(batch_err.contains("errno="));
-        assert!(single_err.contains("errno="));
+        // These helpers validate advice and reject MADV_MERGEABLE
+        assert!(batch_err.contains("MADV_MERGEABLE not supported by process_madvise"));
+        assert!(single_err.contains("MADV_MERGEABLE not supported by process_madvise"));
     }
 }

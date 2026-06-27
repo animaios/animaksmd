@@ -339,11 +339,17 @@ impl KsmController {
         let content =
             fs::read_to_string(&path).map_err(|e| AnimaksmError::Sysfs { path, source: e })?;
         // Extract the active value from bracket notation like "[none] scan-time"
+        // or "none [scan-time]" (kernel formats vary)
         let trimmed = content.trim();
         if trimmed.starts_with('[') {
+            // Format: "[active] options"
             if let Some(active) = trimmed.strip_prefix('[').and_then(|s| s.split(']').next()) {
                 return Ok(active.to_string());
             }
+        } else if let Some(bracket_start) = trimmed.find('[') {
+            // Format: "active [options]" - active mode is before the bracket
+            let active = trimmed[..bracket_start].trim();
+            return Ok(active.to_string());
         }
         Ok(trimmed.to_string())
     }
@@ -471,6 +477,15 @@ mod tests {
     fn test_read_string_bracket_active() {
         let t = seeded![("advisor_mode", "[scan-time] none")];
         assert_eq!(t.ctrl.read_string("advisor_mode").unwrap(), "scan-time");
+    }
+
+    #[test]
+    fn test_read_string_bracket_options() {
+        // Kernel format: "active [options]"
+        let t = seeded![("advisor_mode", "none [scan-time]")];
+        assert_eq!(t.ctrl.read_string("advisor_mode").unwrap(), "none");
+        let t2 = seeded![("advisor_mode", "scan-time [none]")];
+        assert_eq!(t2.ctrl.read_string("advisor_mode").unwrap(), "scan-time");
     }
 
     #[test]

@@ -59,7 +59,7 @@ fn l1_candidate_from_status(status: ProcessStatus, config: &ScannerConfig) -> Op
         return None;
     }
 
-    let anon_rss_mb = status.vm_anon_kb / 1024;
+    let anon_rss_mb = status.anon_rss_kb / 1024;
     if anon_rss_mb < config.min_anon_rss_mb {
         return None;
     }
@@ -263,7 +263,7 @@ impl Scanner {
         let madvise_calls_before = self.stats.madvise_calls;
 
         // === Level 1: Cheap /proc/PID/status filter ===
-        // Only read VmAnon — no maps parsing, no pagemap.
+        // Only read RssAnon — no maps parsing, no pagemap.
         let pids = match procfs::list_pids() {
             Ok(p) => p,
             Err(e) => {
@@ -495,7 +495,7 @@ mod tests {
             ProcessStatus {
                 pid: 2,
                 name: "kthreadd".into(),
-                vm_anon_kb: 1024 * 1024,
+                anon_rss_kb: 1024 * 1024,
                 ..Default::default()
             },
             &config
@@ -506,7 +506,7 @@ mod tests {
             ProcessStatus {
                 pid: 100,
                 name: "tiny".into(),
-                vm_anon_kb: 99 * 1024,
+                anon_rss_kb: 99 * 1024,
                 ..Default::default()
             },
             &config
@@ -517,7 +517,7 @@ mod tests {
             ProcessStatus {
                 pid: 101,
                 name: "animaksm-daemon".into(),
-                vm_anon_kb: 500 * 1024,
+                anon_rss_kb: 500 * 1024,
                 ..Default::default()
             },
             &config
@@ -537,7 +537,7 @@ mod tests {
             ProcessStatus {
                 pid: 200,
                 name: "browser".into(),
-                vm_anon_kb: 256 * 1024,
+                anon_rss_kb: 256 * 1024,
                 ..Default::default()
             },
             &config,
@@ -623,7 +623,7 @@ mod tests {
                 Some(ProcessStatus {
                     pid,
                     name: "tiny".into(),
-                    vm_anon_kb: 64 * 1024,
+                    anon_rss_kb: 64 * 1024,
                     ..Default::default()
                 })
             },
@@ -652,7 +652,7 @@ mod tests {
                 Some(ProcessStatus {
                     pid,
                     name: format!("proc-{pid}"),
-                    vm_anon_kb: 256 * 1024,
+                    anon_rss_kb: 256 * 1024,
                     ..Default::default()
                 })
             },
@@ -687,7 +687,7 @@ mod tests {
                 Some(ProcessStatus {
                     pid,
                     name: format!("proc-{pid}"),
-                    vm_anon_kb: 256 * 1024,
+                    anon_rss_kb: 256 * 1024,
                     ..Default::default()
                 })
             },
@@ -735,7 +735,7 @@ mod tests {
                 Some(ProcessStatus {
                     pid,
                     name: format!("proc-{pid}"),
-                    vm_anon_kb: anon_mb * 1024,
+                    anon_rss_kb: anon_mb * 1024,
                     ..Default::default()
                 })
             },
@@ -772,25 +772,25 @@ mod tests {
             ProcessStatus {
                 pid: 10,
                 name: "small".into(),
-                vm_anon_kb: 64 * 1024,
+                anon_rss_kb: 64 * 1024,
                 ..Default::default()
             },
             ProcessStatus {
                 pid: 11,
                 name: "merged".into(),
-                vm_anon_kb: 256 * 1024,
+                anon_rss_kb: 256 * 1024,
                 ..Default::default()
             },
             ProcessStatus {
                 pid: 12,
                 name: "negative".into(),
-                vm_anon_kb: 512 * 1024,
+                anon_rss_kb: 512 * 1024,
                 ..Default::default()
             },
             ProcessStatus {
                 pid: 13,
                 name: "winner".into(),
-                vm_anon_kb: 1024 * 1024,
+                anon_rss_kb: 1024 * 1024,
                 ..Default::default()
             },
         ];
