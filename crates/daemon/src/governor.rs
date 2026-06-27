@@ -100,6 +100,8 @@ pub struct Governor {
     ksm: KsmController,
     current_level: u8,
     hysteresis_count: u32,
+    /// Consecutive ticks with target above current level (ramp-up damping).
+    ramp_up_count: u32,
     level_entered_at: Instant,
     full_scans_at_level: u64,
     /// Last PSI reading (for fallback stability check).
@@ -115,6 +117,7 @@ impl Governor {
             ksm,
             current_level: 0,
             hysteresis_count: 0,
+            ramp_up_count: 0,
             level_entered_at: Instant::now(),
             full_scans_at_level: 0,
             last_psi: None,
@@ -287,15 +290,36 @@ impl Governor {
     }
 
     /// Compute the actual transition with hysteresis and cooldown.
+    ///
+    /// Ramp-up now also requires consecutive hysteresis readings when the
+    /// target is only +1 above the current level (prevents 0↔1 oscillation
+    /// at the Idle/Low PSI boundary). Multi-level emergency jumps (target
+    /// >= current+2) bypass hysteresis and ramp immediately.
     fn compute_transition(&mut self, target_level: u8) -> u8 {
         if target_level > self.current_level {
-            // Ramp up immediately
+            // Multi-level jump (emergency): ramp immediately
+            if target_level >= self.current_level + 2 {
+                self.hysteresis_count = 0;
+                self.ramp_up_count = 0;
+                self.level_entered_at = Instant::now();
+                self.full_scans_at_level = 0;
+                return target_level;
+            }
+
+            // Single-level ramp-up with hysteresis
+            self.ramp_up_count += 1;
             self.hysteresis_count = 0;
-            self.level_entered_at = Instant::now();
-            self.full_scans_at_level = 0;
-            target_level
+            if self.ramp_up_count >= self.config.hysteresis_readings {
+                self.ramp_up_count = 0;
+                self.level_entered_at = Instant::now();
+                self.full_scans_at_level = 0;
+                target_level
+            } else {
+                self.current_level
+            }
         } else if target_level < self.current_level {
             // Ramp down with hysteresis and cooldown
+            self.ramp_up_count = 0;
             let cooldown = Duration::from_secs(self.config.min_level_duration_secs);
             if self.level_entered_at.elapsed() < cooldown {
                 return self.current_level; // Still in cooldown
@@ -312,8 +336,9 @@ impl Governor {
                 self.current_level
             }
         } else {
-            // Same level, reset hysteresis
+            // Same level, reset both counters
             self.hysteresis_count = 0;
+            self.ramp_up_count = 0;
             self.current_level
         }
     }
@@ -336,8 +361,9 @@ impl Governor {
             "Applying KSM profile"
         );
 
-        // Write order matters: set run=0 first if going to idle, then params, then run=1
-        if profile.run == 0 {
+        // Write order matters: set run=0 first if going to idle, then params, then run=1.
+        // In advisor mode, never stop KSM — the advisor needs run=1 to function.
+        if profile.run == 0 && !self.config.use_advisor {
             let _ = self.ksm.set_run(0);
         }
 
@@ -524,26 +550,31 @@ mod tests {
     // ── compute_transition (ramp-up) ─────────────────────────────────
 
     #[test]
-    fn test_ramp_up_immediate() {
-        let mut gov = make_gov();
+    fn test_ramp_up_single_level_requires_hysteresis() {
+        let mut gov = make_gov_with(|c| c.hysteresis_readings = 3);
         gov.current_level = 0;
-        let result = gov.compute_transition(3);
-        assert_eq!(result, 3, "ramp-up must be immediate");
-        assert_eq!(gov.hysteresis_count, 0, "hysteresis reset on ramp-up");
+
+        // Tick 1: counting
+        assert_eq!(gov.compute_transition(1), 0, "single-level ramp-up must wait for hysteresis");
+        assert_eq!(gov.ramp_up_count, 1);
+
+        // Tick 2: counting
+        assert_eq!(gov.compute_transition(1), 0);
+        assert_eq!(gov.ramp_up_count, 2);
+
+        // Tick 3: threshold reached → ramp up
+        assert_eq!(gov.compute_transition(1), 1, "should ramp up after hysteresis readings");
+        assert_eq!(gov.ramp_up_count, 0, "ramp_up_count reset after ramp-up");
     }
 
     #[test]
-    fn test_ramp_up_from_any_level() {
+    fn test_ramp_up_multi_level_is_immediate() {
         let mut gov = make_gov();
-        for start in 0..=4u8 {
-            gov.current_level = start;
-            let target = start + 1;
-            let result = gov.compute_transition(target);
-            assert_eq!(
-                result, target,
-                "ramp-up from {start} to {target} should be immediate"
-            );
-        }
+        gov.current_level = 0;
+        let result = gov.compute_transition(3);
+        assert_eq!(result, 3, "multi-level ramp-up must be immediate");
+        assert_eq!(gov.hysteresis_count, 0);
+        assert_eq!(gov.ramp_up_count, 0);
     }
 
     #[test]
@@ -556,6 +587,42 @@ mod tests {
             gov.full_scans_at_level, 0,
             "full_scans_at_level reset on ramp-up"
         );
+    }
+
+    #[test]
+    fn test_ramp_up_hysteresis_resets_on_same_level() {
+        let mut gov = make_gov_with(|c| c.hysteresis_readings = 3);
+        gov.current_level = 0;
+
+        // Count 2 ticks toward ramp-up
+        let _ = gov.compute_transition(1);
+        let _ = gov.compute_transition(1);
+        assert_eq!(gov.ramp_up_count, 2);
+
+        // Pressure drops back to idle → same level resets ramp_up_count
+        let _ = gov.compute_transition(0);
+        assert_eq!(gov.ramp_up_count, 0, "ramp_up_count reset when target drops back");
+
+        // Must restart hysteresis from scratch
+        assert_eq!(gov.compute_transition(1), 0);
+        assert_eq!(gov.ramp_up_count, 1);
+    }
+
+    #[test]
+    fn test_ramp_up_hysteresis_resets_on_ramp_down_midway() {
+        let mut gov = make_gov_with(|c| {
+            c.hysteresis_readings = 3;
+            c.min_level_duration_secs = 0;
+        });
+        gov.current_level = 1;
+
+        // Start ramp-up counting from 1→2
+        let _ = gov.compute_transition(2);
+        assert_eq!(gov.ramp_up_count, 1);
+
+        // Pressure drops below current level → ramp-down logic, resets ramp_up_count
+        let _ = gov.compute_transition(0);
+        assert_eq!(gov.ramp_up_count, 0, "ramp_up_count reset by ramp-down direction");
     }
 
     // ── compute_transition (same level) ──────────────────────────────
@@ -647,22 +714,46 @@ mod tests {
     }
 
     #[test]
-    fn test_ramp_down_resets_on_ramp_up_midway() {
+    fn test_emergency_ramp_up_overrides_pending_ramp_down() {
         let mut gov = make_gov_with(|c| {
             c.min_level_duration_secs = 0;
-            c.hysteresis_readings = 5; // lots of readings needed
+            c.hysteresis_readings = 5;
         });
         gov.current_level = 4;
+        gov.level_entered_at = Instant::now() - Duration::from_secs(60);
 
         // Start ramping down (2 hysteresis ticks)
         let _ = gov.compute_transition(1);
         let _ = gov.compute_transition(1);
         assert_eq!(gov.hysteresis_count, 2);
 
-        // PSI spikes back up before we finished stepping down
-        let r = gov.compute_transition(5); // target > current → ramp-up
-        assert_eq!(r, 5, "ramp-up must override pending ramp-down");
+        // Emergency: target=5 >= 4+2 is false, so this is single-level, needs hysteresis.
+        // Instead, use target=5 from level 3 (5 >= 3+2 is true = multi-level jump).
+        gov.current_level = 3;
+        let r = gov.compute_transition(5); // 5 >= 3+2 → emergency immediate
+        assert_eq!(r, 5, "emergency multi-level ramp-up must be immediate");
         assert_eq!(gov.hysteresis_count, 0, "hysteresis reset by ramp-up");
+        assert_eq!(gov.ramp_up_count, 0, "ramp_up_count reset by ramp-up");
+    }
+
+    #[test]
+    fn test_single_level_ramp_up_midway_resets_ramp_down() {
+        let mut gov = make_gov_with(|c| {
+            c.min_level_duration_secs = 0;
+            c.hysteresis_readings = 1;
+        });
+        gov.current_level = 2;
+        gov.level_entered_at = Instant::now() - Duration::from_secs(60);
+
+        // Start ramping down (hysteresis_readings=1, so.steps down immediately)
+        let r = gov.compute_transition(0);
+        assert_eq!(r, 1); // steps down by 1 from 2
+        gov.current_level = r;
+
+        // Now target > current (3 > 1), 3 >= 1+2 → emergency jump
+        let r2 = gov.compute_transition(3);
+        assert_eq!(r2, 3, "multi-level jump is immediate");
+        assert_eq!(gov.hysteresis_count, 0);
     }
 
     // ── apply_profile (dry-run) ──────────────────────────────────────
@@ -700,15 +791,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_apply_profile_idle_stops_ksm() {
+    async fn test_apply_profile_idle_stops_ksm_manual_mode() {
+        let mut ksm = KsmController::new("/sys/kernel/mm/ksm").unwrap();
+        ksm.set_dry_run(true);
+        let mut gov = Governor::new(
+            GovernorConfig {
+                use_advisor: false,
+                ..GovernorConfig::default()
+            },
+            ksm,
+        );
+        let state = new_shared_state();
+
+        // In manual mode, level 0 (Idle) should set run=0
+        gov.apply_profile(0, &state).await;
+        assert_eq!(gov.current_level, 0);
+    }
+
+    #[tokio::test]
+    async fn test_apply_profile_idle_keeps_ksm_running_in_advisor_mode() {
         let mut ksm = KsmController::new("/sys/kernel/mm/ksm").unwrap();
         ksm.set_dry_run(true);
         let mut gov = Governor::new(GovernorConfig::default(), ksm);
         let state = new_shared_state();
 
-        // Going to level 0 (Idle) should be fine
+        // In advisor mode, level 0 should NOT stop KSM — the advisor needs run=1
         gov.apply_profile(0, &state).await;
         assert_eq!(gov.current_level, 0);
+        // The key difference: dry-run won't emit the "Would write KSM parameter run=0"
+        // line because the set_run(0) call is skipped entirely when use_advisor=true.
     }
 
     #[tokio::test]

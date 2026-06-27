@@ -109,8 +109,8 @@ impl Default for GovernorConfig {
             psi_full_threshold: 2.0,
             advisor_scan_time_range: (30, 600),
             max_page_sharing_range: (256, 1024),
-            hysteresis_readings: 3,
-            min_level_duration_secs: 10,
+            hysteresis_readings: 4,
+            min_level_duration_secs: 30,
             stabilization_secs: 30,
             ksm_path: "/sys/kernel/mm/ksm".to_string(),
         }
