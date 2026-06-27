@@ -33,7 +33,7 @@ use animaksm_common::procfs::MapsEntry;
 use nix::sys::ptrace;
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// MADV_MERGEABLE constant (from linux/mman.h).
 const MADV_MERGEABLE: libc::c_int = 12;
@@ -369,21 +369,28 @@ fn find_syscall_in_vdso(pid: u32) -> Result<u64, String> {
         .and_then(|s| u64::from_str_radix(s, 16).ok())
         .ok_or_else(|| "bad vdso start".to_string())?;
     let vdso_end = vdso_line
-        .split('-')
-        .nth(1)
-        .and_then(|s| s.split_whitespace().next())
-        .and_then(|s| u64::from_str_radix(s, 16).ok())
-        .ok_or_else(|| "bad vdso end".to_string())?;
+            .split('-')
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .ok_or_else(|| "bad vdso end".to_string())?;
 
-    // Read vDSO memory to find 0x0F 0x05 (syscall instruction)
-    let mut mem = std::fs::File::open(format!("/proc/{}/mem", pid))
-        .map_err(|e| format!("open /proc/{}/mem: {e}", pid))?;
-    mem.seek(SeekFrom::Start(vdso_start))
-        .map_err(|e| format!("seek: {e}"))?;
-    let sz = (vdso_end - vdso_start) as usize;
-    let mut buf = vec![0u8; sz];
-    mem.read_exact(&mut buf)
-        .map_err(|e| format!("read vdso: {e}"))?;
+        // Read vDSO memory to find 0x0F 0x05 (syscall instruction)
+        // Validate vDSO size to prevent underflow/OOM
+        let sz = vdso_end
+            .checked_sub(vdso_start)
+            .ok_or_else(|| "vdso end before start".to_string())?
+            as usize;
+        if sz > 10 * 1024 * 1024 {
+            return Err("vdso size too large".to_string());
+        }
+        let mut mem = std::fs::File::open(format!("/proc/{}/mem", pid))
+            .map_err(|e| format!("open /proc/{}/mem: {e}", pid))?;
+        mem.seek(SeekFrom::Start(vdso_start))
+            .map_err(|e| format!("seek: {e}"))?;
+        let mut buf = vec![0u8; sz];
+        mem.read_exact(&mut buf)
+            .map_err(|e| format!("read vdso: {e}"))?;
 
     buf.windows(2)
         .position(|w| w == &[0x0f, 0x05])
@@ -458,39 +465,39 @@ fn madvise_via_ptrace(pid: u32, addr: u64, len: usize, syscall_addr: u64) -> Res
     }
 
     // Step 1: continue until syscall entry
-    if let Err(e) = ptrace::syscall(nix_pid, None) {
-        let _ = ptrace::setregs(nix_pid, orig);
-        let _ = ptrace::detach(nix_pid, None);
-        return Err(format!("ptrace syscall (entry) failed: {e}"));
-    }
-    match waitpid(nix_pid, Some(WaitPidFlag::WSTOPPED)) {
-        Ok(WaitStatus::Stopped(_, _)) => {}
-        Ok(other) => {
+        if let Err(e) = ptrace::syscall(nix_pid, None) {
             let _ = ptrace::setregs(nix_pid, orig);
             let _ = ptrace::detach(nix_pid, None);
-            return Err(format!("unexpected wait at syscall entry: {other:?}"));
+            return Err(format!("ptrace syscall (entry) failed: {e}"));
         }
-        Err(e) => {
-            let _ = ptrace::setregs(nix_pid, orig);
-            let _ = ptrace::detach(nix_pid, None);
-            return Err(format!("waitpid at syscall entry failed: {e}"));
+        match waitpid(nix_pid, Some(WaitPidFlag::WSTOPPED)) {
+            Ok(WaitStatus::Stopped(_, nix::sys::signal::Signal::SIGTRAP)) => {}
+            Ok(other) => {
+                let _ = ptrace::setregs(nix_pid, orig);
+                let _ = ptrace::detach(nix_pid, None);
+                return Err(format!("unexpected wait at syscall entry: {other:?}"));
+            }
+            Err(e) => {
+                let _ = ptrace::setregs(nix_pid, orig);
+                let _ = ptrace::detach(nix_pid, None);
+                return Err(format!("waitpid at syscall entry failed: {e}"));
+            }
         }
-    }
 
-    // Step 2: continue until syscall exit
-    if let Err(e) = ptrace::syscall(nix_pid, None) {
-        let _ = ptrace::setregs(nix_pid, orig);
-        let _ = ptrace::detach(nix_pid, None);
-        return Err(format!("ptrace syscall (exit) failed: {e}"));
-    }
-    match waitpid(nix_pid, Some(WaitPidFlag::WSTOPPED)) {
-        Ok(WaitStatus::Stopped(_, _)) => {}
-        Ok(other) => {
+        // Step 2: continue until syscall exit
+        if let Err(e) = ptrace::syscall(nix_pid, None) {
             let _ = ptrace::setregs(nix_pid, orig);
             let _ = ptrace::detach(nix_pid, None);
-            return Err(format!("unexpected wait at syscall exit: {other:?}"));
+            return Err(format!("ptrace syscall (exit) failed: {e}"));
         }
-        Err(e) => {
+        match waitpid(nix_pid, Some(WaitPidFlag::WSTOPPED)) {
+            Ok(WaitStatus::Stopped(_, nix::sys::signal::Signal::SIGTRAP)) => {}
+            Ok(other) => {
+                let _ = ptrace::setregs(nix_pid, orig);
+                let _ = ptrace::detach(nix_pid, None);
+                return Err(format!("unexpected wait at syscall exit: {other:?}"));
+            }
+            Err(e) => {
             let _ = ptrace::setregs(nix_pid, orig);
             let _ = ptrace::detach(nix_pid, None);
             return Err(format!("waitpid at syscall exit failed: {e}"));
@@ -508,13 +515,13 @@ fn madvise_via_ptrace(pid: u32, addr: u64, len: usize, syscall_addr: u64) -> Res
     };
 
     // Restore ALL original registers before detaching
-    if let Err(e) = ptrace::setregs(nix_pid, orig) {
-        // Non-fatal, but log — the target may crash if regs are corrupt
-        warn!(
-            pid,
-            "failed to restore registers after ptrace injection: {e}"
-        );
-    }
+        if let Err(e) = ptrace::setregs(nix_pid, orig) {
+            // CRITICAL: if register restoration fails, the target will resume
+            // with corrupted registers (pointing to vDSO syscall) and crash.
+            // Treat as fatal, detach and return error.
+            let _ = ptrace::detach(nix_pid, None);
+            return Err(format!("failed to restore registers after ptrace injection: {e}"));
+        }
 
     if let Err(e) = ptrace::detach(nix_pid, None) {
         return Err(format!("ptrace detach failed: {e}"));
