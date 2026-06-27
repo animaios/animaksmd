@@ -278,10 +278,15 @@ impl Governor {
         self.last_psi = Some(psi.clone());
     }
 
-    /// Map pressure level to KSM aggressiveness level (0-5).
+    /// Map pressure level to KSM aggressiveness level (1-5).
+    ///
+    /// Level 0 (KSM stopped) is never chosen automatically — Idle and Low
+    /// both map to level 1 (lightest scanning). This avoids 0↔1 oscillation
+    /// at the Idle/Low pressure boundary where PSI scores hover near the
+    /// classification threshold.
     fn pressure_to_level(&self, pressure: PressureLevel) -> u8 {
         match pressure {
-            PressureLevel::Idle => 0,
+            PressureLevel::Idle => 1,
             PressureLevel::Low => 1,
             PressureLevel::Medium => 3,
             PressureLevel::High => 4,
@@ -518,7 +523,7 @@ mod tests {
     #[test]
     fn test_pressure_to_level_idle() {
         let gov = make_gov();
-        assert_eq!(gov.pressure_to_level(PressureLevel::Idle), 0);
+        assert_eq!(gov.pressure_to_level(PressureLevel::Idle), 1, "Idle and Low both map to level 1 (minimal scanning)");
     }
 
     #[test]
