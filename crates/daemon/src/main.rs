@@ -9,6 +9,7 @@ mod madvise;
 mod metrics;
 mod scanner;
 
+use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
@@ -48,6 +49,12 @@ enum Commands {
         #[arg(short, long, default_value = "/etc/animaksm.toml")]
         config: PathBuf,
     },
+    /// Show detailed KSM statistics (like uksmdstats)
+    Stats {
+        /// Path to configuration file
+        #[arg(short, long, default_value = "/etc/animaksm.toml")]
+        config: PathBuf,
+    },
     /// Restore KSM parameters from snapshot
     RestoreKsm {
         /// Path to configuration file
@@ -63,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Run { config, dry_run } => run_daemon(config, dry_run).await,
         Commands::Status { config } => show_status(config).await,
+        Commands::Stats { config } => show_stats(config).await,
         Commands::RestoreKsm { config } => restore_ksm(config).await,
     }
 }
@@ -226,6 +234,105 @@ async fn show_status(config_path: PathBuf) -> anyhow::Result<()> {
     print!(
         "{}",
         build_status_output(&config_path, Path::new("/proc/pressure/memory"))?
+    );
+
+    Ok(())
+}
+
+async fn show_stats(config_path: PathBuf) -> anyhow::Result<()> {
+    init_tracing("info");
+
+    let config = load_config_or_default(&config_path)?;
+    let ksm = KsmController::new(&config.governor.ksm_path)?;
+    let stats = ksm.read_stats()?;
+    let _cfg = ksm.read_config()?;
+
+    println!("======================================================");
+    println!("animaksm with KSM statistics support");
+    println!("======================================================");
+
+    // Read additional KSM stats from sysfs
+    let ksm_path = Path::new(&config.governor.ksm_path);
+
+    let full_scans = fs::read_to_string(ksm_path.join("full_scans"))
+        .unwrap_or_default()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let sleep_millisecs = fs::read_to_string(ksm_path.join("sleep_millisecs"))
+        .unwrap_or_default()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let max_page_sharing = fs::read_to_string(ksm_path.join("max_page_sharing"))
+        .unwrap_or_default()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let pages_to_scan = fs::read_to_string(ksm_path.join("pages_to_scan"))
+        .unwrap_or_default()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let stable_node_chains = fs::read_to_string(ksm_path.join("stable_node_chains"))
+        .unwrap_or_default()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let stable_node_dups = fs::read_to_string(ksm_path.join("stable_node_dups"))
+        .unwrap_or_default()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let use_zero_pages = fs::read_to_string(ksm_path.join("use_zero_pages"))
+        .unwrap_or_default()
+        .trim()
+        .parse::<u64>()
+        .unwrap_or(0);
+    let pages_shared = stats.pages_shared;
+    let pages_sharing = stats.pages_sharing;
+    let pages_unshared = stats.pages_unshared;
+    let general_profit = stats.general_profit;
+
+    println!("Full scans:                 {}", full_scans);
+    println!("Interval:                   {} ms", sleep_millisecs);
+    println!("Max page sharing ratio:     {}", max_page_sharing);
+    println!("Pages to scan:              {}", pages_to_scan);
+    println!("Pages over ratio:           {}", stable_node_chains);
+    println!("Duplicated pages:           {}", stable_node_dups);
+    println!("Use zero pages:             {}", use_zero_pages);
+    println!();
+
+    if pages_shared > 0 && pages_sharing > 0 {
+        let sharing_shared_ratio = pages_sharing as f64 / pages_shared as f64;
+        let unshared_sharing_ratio = pages_unshared as f64 / pages_sharing as f64;
+        println!("Sharing/shared ratio:       {:.4}", sharing_shared_ratio);
+        println!("Unshared/sharing ratio:     {:.4}", unshared_sharing_ratio);
+    } else {
+        println!("Sharing/shared ratio:       0");
+        println!("Unshared/sharing ratio:     0");
+    }
+    println!();
+
+    // formula MiB: pages * page_size / (1024 * 1024) = pages / 256
+    println!(
+        "Pages sharing:              {:.1} MiB",
+        pages_sharing as f64 / 256.0
+    );
+    println!(
+        "Pages shared:               {:.1} MiB",
+        pages_shared as f64 / 256.0
+    );
+    println!(
+        "Pages unshared:             {:.1} MiB",
+        pages_unshared as f64 / 256.0
+    );
+    println!();
+
+    // general_profit is in bytes, convert to MiB
+    println!(
+        "General profit:             {:.1} MiB",
+        general_profit as f64 / 1024.0 / 1024.0
     );
 
     Ok(())
