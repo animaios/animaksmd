@@ -338,19 +338,17 @@ impl KsmController {
         let path = self.base_path.join(param);
         let content =
             fs::read_to_string(&path).map_err(|e| AnimaksmError::Sysfs { path, source: e })?;
-        // Extract the active value from bracket notation like "[none] scan-time"
-        // or "none [scan-time]" (kernel formats vary)
+        // Extract the active value from bracket notation.
+        // Kernel advisor_mode outputs either "[none] scan-time" or "none [scan-time]"
+        // In both cases, the active mode is the one inside brackets.
         let trimmed = content.trim();
-        if trimmed.starts_with('[') {
-            // Format: "[active] options"
-            if let Some(active) = trimmed.strip_prefix('[').and_then(|s| s.split(']').next()) {
-                return Ok(active.to_string());
+        if let Some(bracket_start) = trimmed.find('[') {
+            if let Some(bracket_end) = trimmed[bracket_start..].find(']') {
+                let active = &trimmed[bracket_start + 1..bracket_start + bracket_end];
+                return Ok(active.trim().to_string());
             }
-        } else if let Some(bracket_start) = trimmed.find('[') {
-            // Format: "active [options]" - active mode is before the bracket
-            let active = trimmed[..bracket_start].trim();
-            return Ok(active.to_string());
         }
+        // Fallback: no brackets found, return trimmed content
         Ok(trimmed.to_string())
     }
 
@@ -475,16 +473,18 @@ mod tests {
 
     #[test]
     fn test_read_string_bracket_active() {
-        let t = seeded![("advisor_mode", "[scan-time] none")];
+        // Kernel format when scan-time is active: "none [scan-time]"
+        let t = seeded![("advisor_mode", "none [scan-time]")];
         assert_eq!(t.ctrl.read_string("advisor_mode").unwrap(), "scan-time");
     }
 
     #[test]
     fn test_read_string_bracket_options() {
-        // Kernel format: "active [options]"
-        let t = seeded![("advisor_mode", "none [scan-time]")];
+        // Kernel format when none is active: "[none] scan-time"
+        // Kernel format when scan-time is active: "none [scan-time]"
+        let t = seeded![("advisor_mode", "[none] scan-time")];
         assert_eq!(t.ctrl.read_string("advisor_mode").unwrap(), "none");
-        let t2 = seeded![("advisor_mode", "scan-time [none]")];
+        let t2 = seeded![("advisor_mode", "none [scan-time]")];
         assert_eq!(t2.ctrl.read_string("advisor_mode").unwrap(), "scan-time");
     }
 
