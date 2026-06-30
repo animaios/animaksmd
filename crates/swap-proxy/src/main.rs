@@ -456,7 +456,7 @@ fn ubd_devices_in_swapon_output(stdout: &str) -> Vec<String> {
         .filter_map(|line| {
             let mut cols = line.split_whitespace();
             let name = cols.next()?;
-            if name.contains("ubd") {
+            if name.starts_with("/dev/ubd") {
                 Some(name.to_string())
             } else {
                 None

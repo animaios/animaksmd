@@ -58,7 +58,10 @@ impl BlockRequest {
     }
 
     fn validate_page_aligned(self) -> Result<Self, i32> {
-        if !self.offset.is_multiple_of(PAGE_SIZE as u64) || !self.bytes.is_multiple_of(PAGE_SIZE) {
+        // MSRV 1.75: usize::is_multiple_of was stabilized in 1.87; stay on %.
+        #[allow(clippy::manual_is_multiple_of)]
+        let aligned = self.offset % (PAGE_SIZE as u64) == 0 && self.bytes % PAGE_SIZE == 0;
+        if !aligned {
             return Err(-libc::EINVAL);
         }
 
@@ -124,7 +127,12 @@ pub(crate) fn run(
             "ublk swap proxy device is live"
         );
         if let Some(cb) = bootstrap_for_device_fn.lock().unwrap().take() {
-            cb(Path::new(&bdev));
+            // Run the bootstrap (mkswap + swapon) on a background thread so a
+            // slow or hung command cannot block the ublk control loop.
+            let bdev = std::path::PathBuf::from(&bdev);
+            std::thread::spawn(move || {
+                cb(&bdev);
+            });
         }
     };
 
@@ -250,6 +258,9 @@ fn execute_request(
             for (page_idx, chunk) in buffer[..request.bytes].chunks_mut(PAGE_SIZE).enumerate() {
                 let offset = request.offset + (page_idx * PAGE_SIZE) as u64;
                 let page = engine.handle_read(offset).map_err(|_| -libc::EIO)?;
+                if page.len() != chunk.len() {
+                    return Err(-libc::EIO);
+                }
                 chunk.copy_from_slice(&page);
             }
             Ok(request.bytes)
