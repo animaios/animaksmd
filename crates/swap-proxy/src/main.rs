@@ -448,19 +448,23 @@ fn cleanup_after_crash() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parse `/proc/swaps`-style output and return the device paths of active ublk
-/// swap devices (typically `/dev/ubd0`, `/dev/ubd1`, ...).
+/// Parse `/proc/swaps`-style output and return paths of active ublk swap
+/// devices.
 ///
-/// Matches `/dev/ubd` followed by one or more digits (e.g. `/dev/ubd0`),
-/// excluding unrelated names like `/dev/ubdish` or `/dev/mapper/vg-ubdswap`.
+/// Kernel 7.1+ exposes ublk block devices as `/dev/ublkb0`, `/dev/ublkb1`, …
+/// Older kernels (and FUSE-based frontends) used `/dev/ubd0`, `/dev/ubd1`, …
+/// Match both naming schemes while excluding unrelated names such as
+/// `/dev/ubdish` or `/dev/mapper/vg-ubdswap`. The trailing token must be the
+/// prefix followed by one or more ASCII digits, nothing else.
 fn ubd_devices_in_swapon_output(stdout: &str) -> Vec<String> {
     stdout
         .lines()
         .filter_map(|line| {
             let mut cols = line.split_whitespace();
             let name = cols.next()?;
-            let rest = name.strip_prefix("/dev/ubd")?;
-            // Suffix must be non-empty and all digits.
+            let rest = name
+                .strip_prefix("/dev/ublkb")
+                .or_else(|| name.strip_prefix("/dev/ubd"))?;
             if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
                 return None;
             }
@@ -785,6 +789,36 @@ mod tests {
     fn test_cleanup_handles_empty_swapon_output() {
         let devices = ubd_devices_in_swapon_output("NAME TYPE SIZE USED PRIO\n");
         assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_matches_ublkb_modern_kernel_naming() {
+        // Live-tested on kernel 7.1.2: ublk exposes /dev/ublkbN.
+        let stdout = "NAME       TYPE SIZE USED PRIO\n/dev/ublkb0 partition 1G 0B 100\n/dev/ublkb1 partition 1G 0B  99\n";
+        let devices = ubd_devices_in_swapon_output(stdout);
+        assert_eq!(
+            devices,
+            vec![String::from("/dev/ublkb0"), String::from("/dev/ublkb1")]
+        );
+    }
+
+    #[test]
+    fn test_cleanup_matches_legacy_ubd_kernel_naming() {
+        // Older kernels / frontends still use /dev/ubdN.
+        let stdout = "NAME      TYPE SIZE USED PRIO\n/dev/ubd0 partition 8G 0B 100\n";
+        let devices = ubd_devices_in_swapon_output(stdout);
+        assert_eq!(devices, vec![String::from("/dev/ubd0")]);
+    }
+
+    #[test]
+    fn test_cleanup_rejects_partial_prefix_match() {
+        // /dev/ubd1ish (weird but possible naming) and /dev/ublkb9xyz must NOT match.
+        let stdout = "NAME         TYPE SIZE USED PRIO\n/dev/ubd1ish  partition 4G 0B 100\n/dev/ublkb9xyz partition 4G 0B 100\n";
+        let devices = ubd_devices_in_swapon_output(stdout);
+        assert!(
+            devices.is_empty(),
+            "expected no partial-prefix matches, got: {devices:?}"
+        );
     }
 
     #[test]
