@@ -66,7 +66,16 @@ impl BlockRequest {
     }
 }
 
-pub(crate) fn run(engine: Arc<ProxyEngine>, size_gb: u64) -> anyhow::Result<()> {
+/// Run the ublk frontend. Blocks until the device is stopped (external
+/// `ublk_del_dev`, SIGTERM, etc.).
+///
+/// `bootstrap` fires once when the kernel has created the block device; it
+/// receives the `/dev/ubd*` path so callers can `mkswap` and `swapon` it.
+pub(crate) fn run(
+    engine: Arc<ProxyEngine>,
+    size_gb: u64,
+    bootstrap: impl FnOnce(&Path) + Send + 'static,
+) -> anyhow::Result<()> {
     let total_bytes = size_gb
         .checked_mul(1024 * 1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("device size overflows u64"))?;
@@ -76,6 +85,9 @@ pub(crate) fn run(engine: Arc<ProxyEngine>, size_gb: u64) -> anyhow::Result<()> 
 
     // Shared state for queue initialization errors
     let init_errors = Arc::new(Mutex::new(Vec::<anyhow::Error>::new()));
+    // One-shot wrapper for the bootstrap callback; device_fn (called by
+    // run_target on ublk-add) hands ownership to the inner FnOnce.
+    let bootstrap = Arc::new(Mutex::new(Some(bootstrap)));
 
     let ctrl = UblkCtrlBuilder::default()
         .name("animaksm_swap_proxy")
@@ -103,12 +115,17 @@ pub(crate) fn run(engine: Arc<ProxyEngine>, size_gb: u64) -> anyhow::Result<()> 
         );
     };
 
+    let bootstrap_for_device_fn = Arc::clone(&bootstrap);
     let device_fn = move |ctrl: &libublk::ctrl::UblkCtrl| {
+        let bdev = ctrl.get_bdev_path();
         info!(
             dev_id = ctrl.dev_info().dev_id,
-            block_device = %ctrl.get_bdev_path(),
+            block_device = %bdev,
             "ublk swap proxy device is live"
         );
+        if let Some(cb) = bootstrap_for_device_fn.lock().unwrap().take() {
+            cb(Path::new(&bdev));
+        }
     };
 
     // run_target blocks until the device is stopped
@@ -285,7 +302,7 @@ mod tests {
     fn engine() -> (tempfile::TempDir, Arc<ProxyEngine>) {
         let dir = tempfile::tempdir().unwrap();
         let path = PathBuf::from(dir.path()).join("pagestore.dat");
-        let engine = Arc::new(ProxyEngine::new(&path, 1, 128).unwrap());
+        let engine = Arc::new(ProxyEngine::new(&path, 1, 128, 1024).unwrap());
         (dir, engine)
     }
 

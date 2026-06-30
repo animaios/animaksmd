@@ -4,9 +4,14 @@
 //! identical pages before they reach compressed storage. Uses
 //! xxh3-128 fingerprinting with a Bloom filter + concurrent hash map.
 //!
+//! In real mode, the proxy exposes the dedup storage as a ublk block
+//! device and runs `mkswap` + `swapon` on it so the kernel swap
+//! subsystem actually stores compressed-and-deduplicated pages.
+//!
 //! NOTE: This is an experimental component. It requires the ublk_drv
-//! kernel module (not available in all environments). The proxy is
-//! designed to fail-open: if it crashes, zram0 remains as direct swap.
+//! kernel module and CAP_SYS_ADMIN (not available in all environments).
+//! The proxy is designed to fail-open: if it crashes, zram0 remains as
+//! direct swap.
 
 mod backend;
 mod dedup;
@@ -17,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use animaksm_common::config::AnimaksmConfig;
 use clap::{Parser, Subcommand};
 use parking_lot::Mutex;
 use tracing::{info, warn};
@@ -30,6 +36,10 @@ use fingerprint::{fingerprint_page, PAGE_SIZE};
     about = "Experimental deduplicating swap proxy"
 )]
 struct Cli {
+    /// Path to TOML config (overrides defaults, overridden by explicit flags)
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -38,21 +48,29 @@ struct Cli {
 enum Commands {
     /// Start the swap proxy
     Run {
-        /// Path to page store file (or block device)
-        #[arg(long, default_value = "/var/lib/animaksm/pagestore.dat")]
-        store_path: PathBuf,
-
         /// Device size in GB
-        #[arg(long, default_value_t = 8)]
-        size_gb: u64,
+        #[arg(long)]
+        size_gb: Option<u64>,
+
+        /// Page store path (ephemeral dedup table + backend slot store)
+        #[arg(long, value_name = "PATH")]
+        page_store_path: Option<PathBuf>,
 
         /// Maximum dedup table entries
-        #[arg(long, default_value_t = 1_000_000)]
-        max_entries: u64,
+        #[arg(long)]
+        max_entries: Option<u64>,
 
-        /// Dry-run mode: simulate without actual block device
+        /// Bloom filter capacity (unique pages to size for)
+        #[arg(long)]
+        bloom_capacity: Option<usize>,
+
+        /// Dry-run mode: simulate without a block device
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+
+        /// Do NOT mkswap + swapon the created ublk device
+        #[arg(long, default_value_t = false)]
+        no_bootstrap: bool,
     },
     /// Show proxy statistics
     Stats {
@@ -60,7 +78,7 @@ enum Commands {
         #[arg(long, default_value = "/var/lib/animaksm/pagestore.dat")]
         store_path: PathBuf,
     },
-    /// Clean up after a proxy crash
+    /// Clean up after a proxy crash (swapoff ublk devices, restore zram)
     Cleanup,
 }
 
@@ -96,9 +114,13 @@ pub(crate) struct ProxyEngine {
 }
 
 impl ProxyEngine {
-    pub(crate) fn new(store_path: &Path, size_gb: u64, max_entries: u64) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        store_path: &Path,
+        size_gb: u64,
+        max_entries: u64,
+        bloom_capacity: usize,
+    ) -> anyhow::Result<Self> {
         let total_slots = (size_gb * 1024 * 1024 * 1024) / PAGE_SIZE as u64;
-        let bloom_capacity = max_entries as usize;
 
         let store = if store_path.exists() {
             backend::PageStore::open(store_path, total_slots)?
@@ -113,6 +135,7 @@ impl ProxyEngine {
             total_slots,
             size_gb,
             max_entries,
+            bloom_capacity,
             "Page store initialized"
         );
 
@@ -328,17 +351,47 @@ fn normalize_page(data: &[u8]) -> [u8; PAGE_SIZE] {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    run_command(cli.command)
+    let config = match &cli.config {
+        Some(path) => AnimaksmConfig::load(path)?,
+        None => AnimaksmConfig::default(),
+    };
+    run_command(cli.command, config)
 }
 
-fn run_command(command: Commands) -> anyhow::Result<()> {
+/// Resolved swap-proxy runtime parameters: TOML defaults merged with CLI overrides.
+#[derive(Debug)]
+struct RunConfig {
+    page_store_path: PathBuf,
+    size_gb: u64,
+    max_entries: u64,
+    bloom_capacity: usize,
+    /// When true, run mkswap + swapon on the created ublk device.
+    bootstrap: bool,
+}
+
+fn run_command(command: Commands, config: AnimaksmConfig) -> anyhow::Result<()> {
     match command {
         Commands::Run {
-            store_path,
             size_gb,
+            page_store_path,
             max_entries,
+            bloom_capacity,
             dry_run,
-        } => run_proxy(store_path, size_gb, max_entries, dry_run),
+            no_bootstrap,
+        } => {
+            let sp = &config.swap_proxy;
+            run_proxy_v2(
+                RunConfig {
+                    page_store_path: page_store_path
+                        .unwrap_or_else(|| PathBuf::from(&sp.page_store_path)),
+                    size_gb: size_gb.unwrap_or(sp.device_size_gb),
+                    max_entries: max_entries.unwrap_or(sp.dedup_table_max_entries),
+                    bloom_capacity: bloom_capacity.unwrap_or(sp.bloom_capacity),
+                    bootstrap: !no_bootstrap,
+                },
+                dry_run,
+            )
+        }
         Commands::Stats { store_path } => show_stats_command(&store_path),
         Commands::Cleanup => cleanup_after_crash(),
     }
@@ -351,19 +404,65 @@ fn show_stats_command(store_path: &Path) -> anyhow::Result<()> {
 }
 
 fn cleanup_after_crash() -> anyhow::Result<()> {
-    info!("Cleaning up after proxy crash");
-    let output = std::process::Command::new("swapon").arg("--show").output();
-    match output {
+    info!("Cleaning up after proxy crash / service stop");
+
+    // 1. swapoff any ublk-backed swap device the prior run left active.
+    let swapon_output = std::process::Command::new("swapon")
+        .arg("--show")
+        .arg("--noheadings")
+        .output();
+    match swapon_output {
         Ok(o) => {
-            for line in cleanup_messages_from_swapon_stdout(&String::from_utf8_lossy(&o.stdout)) {
-                println!("{line}");
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            for ubd in ubd_devices_in_swapon_output(&stdout) {
+                info!(device = %ubd, "swapoff on ublk device");
+                let status = std::process::Command::new("swapoff")
+                    .arg(&ubd)
+                    .output()
+                    .ok()
+                    .and_then(|o| o.status.code().map(|c| c == 0))
+                    .unwrap_or(false);
+                if status {
+                    println!("swapoff {ubd} ok");
+                } else {
+                    println!("swapoff {ubd} FAILED");
+                }
             }
         }
         Err(e) => {
-            println!("{}", cleanup_message_from_swapon_error(&e));
+            println!("Could not enumerate swap devices (swapon --show): {e}");
         }
     }
+
+    // 2. Restore zram0 as a fail-open swap backend if needed.
+    for line in cleanup_messages_from_swapon_stdout(&String::from_utf8_lossy(
+        &std::process::Command::new("swapon")
+            .arg("--show")
+            .output()
+            .map(|o| o.stdout)
+            .unwrap_or_default(),
+    )) {
+        println!("{line}");
+    }
+
     Ok(())
+}
+
+/// Parse `/proc/swaps`-style output and return the device paths of active ublk
+/// swap devices (typically `/dev/ubd0`, `/dev/ubd1`, ...).
+fn ubd_devices_in_swapon_output(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace();
+            let name = cols.next()?;
+            if name.contains("ubd") {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn cleanup_messages_from_swapon_stdout(stdout: &str) -> Vec<&'static str> {
@@ -377,55 +476,113 @@ fn cleanup_messages_from_swapon_stdout(stdout: &str) -> Vec<&'static str> {
     }
 }
 
-fn cleanup_message_from_swapon_error(error: &std::io::Error) -> String {
-    format!("Could not check swap status: {error}")
-}
-
-fn run_proxy(
-    store_path: PathBuf,
-    size_gb: u64,
-    max_entries: u64,
-    dry_run: bool,
-) -> anyhow::Result<()> {
-    // Initialize tracing
+fn run_proxy_v2(run: RunConfig, dry_run: bool) -> anyhow::Result<()> {
+    // Initialize tracing (only the first call has an effect)
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();
 
-    info!(
-        version = env!("CARGO_PKG_VERSION"),
-        store = %store_path.display(),
+    let RunConfig {
+        page_store_path,
         size_gb,
         max_entries,
+        bloom_capacity,
+        bootstrap,
+    } = run;
+
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        store = %page_store_path.display(),
+        size_gb,
+        max_entries,
+        bloom_capacity,
+        bootstrap,
         dry_run,
         "animaksm-swap-proxy starting"
     );
 
     if dry_run {
         info!("DRY RUN mode: simulating proxy without actual block device");
-        run_dry_run_simulation(store_path, size_gb, max_entries)?;
+        run_dry_run_simulation(page_store_path, size_gb, max_entries, bloom_capacity)?;
     } else {
-        run_real_proxy(store_path, size_gb, max_entries)?;
+        run_real_proxy(
+            page_store_path,
+            size_gb,
+            max_entries,
+            bloom_capacity,
+            bootstrap,
+        )?;
     }
 
     Ok(())
 }
 
-fn run_real_proxy(store_path: PathBuf, size_gb: u64, max_entries: u64) -> anyhow::Result<()> {
+fn run_real_proxy(
+    page_store_path: PathBuf,
+    size_gb: u64,
+    max_entries: u64,
+    bloom_capacity: usize,
+    bootstrap: bool,
+) -> anyhow::Result<()> {
     info!("Starting real ublk frontend");
     ublk_frontend::ensure_available()?;
-    let engine = Arc::new(ProxyEngine::new(&store_path, size_gb, max_entries)?);
-    ublk_frontend::run(engine, size_gb)
+    let engine = Arc::new(ProxyEngine::new(
+        &page_store_path,
+        size_gb,
+        max_entries,
+        bloom_capacity,
+    )?);
+    if bootstrap {
+        info!("Bootstrapping ublk device as swap (mkswap + swapon)");
+        ublk_frontend::run(engine, size_gb, |bdev| {
+            if let Err(err) = bootstrap_swap(bdev) {
+                // Bootstrap failure is NOT fatal: the ublk device remains usable
+                // as a regular block device, operator can mkswap/swapon manually.
+                warn!(bdev = %bdev.display(), %err, "skipping swap bootstrap");
+            }
+        })
+    } else {
+        info!("Swap bootstrap disabled (--no-bootstrap)");
+        ublk_frontend::run(engine, size_gb, |_bdev| {})
+    }
+}
+
+/// Best-effort mkswap + swapon on a freshly-created ublk block device.
+fn bootstrap_swap(bdev: &Path) -> anyhow::Result<()> {
+    info!(bdev = %bdev.display(), "running mkswap on ublk device");
+    let status = std::process::Command::new("mkswap")
+        .arg(bdev)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to exec mkswap: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("mkswap exited with status {status}");
+    }
+
+    info!(bdev = %bdev.display(), "swapon on ublk device");
+    let status = std::process::Command::new("swapon")
+        .arg(bdev)
+        .status()
+        .map_err(|e| anyhow::anyhow!("failed to exec swapon: {e}"))?;
+    if !status.success() {
+        // mkswap succeeded but swapon failed — the swap header is valid, the
+        // device remains usable. Back off with a hard error so the operator can
+        // investigate.
+        anyhow::bail!("swapon exited with status {status}");
+    }
+
+    info!(bdev = %bdev.display(), "ublk device is now active as swap");
+    Ok(())
 }
 
 fn run_dry_run_simulation(
     store_path: PathBuf,
     size_gb: u64,
     max_entries: u64,
+    bloom_capacity: usize,
 ) -> anyhow::Result<()> {
-    let engine = ProxyEngine::new(&store_path, size_gb, max_entries)?;
+    let engine = ProxyEngine::new(&store_path, size_gb, max_entries, bloom_capacity)?;
 
     info!("Generating synthetic workload (opportunistic mode demo)...");
     info!("Phase 1: Passthrough mode (simulating high memory pressure)");
@@ -516,7 +673,7 @@ mod tests {
     fn test_proxy_engine_new_creates_store_parent_directory() {
         let (_dir, path) = engine_path();
 
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
 
         assert!(path.exists());
         assert!(engine.passthrough.load(Ordering::Relaxed));
@@ -531,26 +688,30 @@ mod tests {
         let run = Cli::try_parse_from([
             "animaksm-swap-proxy",
             "run",
-            "--store-path",
+            "--page-store-path",
             "/tmp/store.dat",
             "--size-gb",
             "2",
             "--max-entries",
             "42",
             "--dry-run",
+            "--no-bootstrap",
         ])
         .unwrap();
         match run.command {
             Commands::Run {
-                store_path,
+                page_store_path,
                 size_gb,
                 max_entries,
                 dry_run,
+                no_bootstrap,
+                bloom_capacity: _,
             } => {
-                assert_eq!(store_path, PathBuf::from("/tmp/store.dat"));
-                assert_eq!(size_gb, 2);
-                assert_eq!(max_entries, 42);
+                assert_eq!(page_store_path, Some(PathBuf::from("/tmp/store.dat")));
+                assert_eq!(size_gb, Some(2));
+                assert_eq!(max_entries, Some(42));
                 assert!(dry_run);
+                assert!(no_bootstrap);
             }
             _ => panic!("expected run command"),
         }
@@ -570,9 +731,12 @@ mod tests {
 
     #[test]
     fn test_run_command_stats_prints_store_path() {
-        run_command(Commands::Stats {
-            store_path: PathBuf::from("/tmp/store.dat"),
-        })
+        run_command(
+            Commands::Stats {
+                store_path: PathBuf::from("/tmp/store.dat"),
+            },
+            AnimaksmConfig::default(),
+        )
         .unwrap();
     }
 
@@ -600,18 +764,29 @@ mod tests {
     }
 
     #[test]
-    fn test_cleanup_message_formats_swapon_error() {
-        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "missing swapon");
-        assert_eq!(
-            cleanup_message_from_swapon_error(&err),
-            "Could not check swap status: missing swapon"
-        );
+    fn test_cleanup_detects_ubd_device_in_swapon_output() {
+        let stdout = "NAME       TYPE SIZE USED PRIO\n/dev/ubd0  partition 8G 0B 100\n";
+        let devices = ubd_devices_in_swapon_output(stdout);
+        assert_eq!(devices, vec![String::from("/dev/ubd0")]);
+    }
+
+    #[test]
+    fn test_cleanup_ignores_zram_only_swapon_output() {
+        let stdout = "NAME       TYPE SIZE USED PRIO\n/dev/zram0 partition 4G 0B 100\n";
+        let devices = ubd_devices_in_swapon_output(stdout);
+        assert!(devices.is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_handles_empty_swapon_output() {
+        let devices = ubd_devices_in_swapon_output("NAME TYPE SIZE USED PRIO\n");
+        assert!(devices.is_empty());
     }
 
     #[test]
     fn test_handle_write_passthrough_writes_direct_slot_and_counts_unique() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
         let page = vec![0xAA; PAGE_SIZE];
 
         engine.handle_write(PAGE_SIZE as u64, &page).unwrap();
@@ -628,7 +803,7 @@ mod tests {
     #[test]
     fn test_handle_write_dedup_mode_records_duplicate_translation() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
         engine.passthrough.store(false, Ordering::Relaxed);
         let page = vec![0xAB; PAGE_SIZE];
 
@@ -651,7 +826,7 @@ mod tests {
     #[test]
     fn test_handle_write_replaces_old_translation_and_removes_reference() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
         engine.passthrough.store(false, Ordering::Relaxed);
         let page_a = vec![0xAA; PAGE_SIZE];
         let page_b = vec![0xBB; PAGE_SIZE];
@@ -668,7 +843,7 @@ mod tests {
     #[test]
     fn test_handle_discard_removes_translation_and_counts_discard() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
         engine.passthrough.store(false, Ordering::Relaxed);
         let page = vec![0xCC; PAGE_SIZE];
 
@@ -685,7 +860,7 @@ mod tests {
     #[test]
     fn test_passthrough_overwrite_clears_old_dedup_translation() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
         let page_a = vec![0xAA; PAGE_SIZE];
         let page_b = vec![0xBB; PAGE_SIZE];
 
@@ -704,7 +879,7 @@ mod tests {
     #[test]
     fn test_table_full_fallback_still_updates_translation() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 0).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 0, 1024).unwrap();
         engine.passthrough.store(false, Ordering::Relaxed);
         let page = vec![0x44; PAGE_SIZE];
 
@@ -718,7 +893,7 @@ mod tests {
     #[test]
     fn test_direct_and_dedup_slots_do_not_alias() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
         let direct_page = vec![0x11; PAGE_SIZE];
         let dedup_page = vec![0x22; PAGE_SIZE];
 
@@ -733,7 +908,7 @@ mod tests {
     #[test]
     fn test_discarded_page_reads_as_zeroes_without_stale_backend_data() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
         let page = vec![0x77; PAGE_SIZE];
 
         engine.handle_write(0, &page).unwrap();
@@ -745,7 +920,7 @@ mod tests {
     #[test]
     fn test_short_writes_are_hashed_as_zero_padded_pages() {
         let (_dir, path) = engine_path();
-        let engine = ProxyEngine::new(&path, 1, 128).unwrap();
+        let engine = ProxyEngine::new(&path, 1, 128, 1024).unwrap();
         engine.passthrough.store(false, Ordering::Relaxed);
 
         engine.handle_write(0, &[1, 2, 3]).unwrap();
@@ -760,7 +935,14 @@ mod tests {
     #[test]
     fn test_run_proxy_dry_run_simulation_completes() {
         let (_dir, path) = engine_path();
-        run_proxy(path, 1, 2048, true).unwrap();
+        let run = RunConfig {
+            page_store_path: path,
+            size_gb: 1,
+            max_entries: 2048,
+            bloom_capacity: 4096,
+            bootstrap: false,
+        };
+        run_proxy_v2(run, true).unwrap();
     }
 
     #[test]
